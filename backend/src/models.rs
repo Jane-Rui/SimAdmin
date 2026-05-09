@@ -341,6 +341,145 @@ pub struct ConnectivityCheckResponse {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct DdnsStatusResponse {
+    pub enabled: bool,
+    pub running: bool,
+    pub provider: String,
+    pub last_sync_at: Option<String>,
+    pub last_ipv4: Option<String>,
+    pub last_ipv6: Option<String>,
+    pub last_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DdnsLogEntry {
+    pub timestamp: String,
+    pub level: String,
+    pub record_type: String,
+    pub domains: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct DdnsLogsResponse {
+    pub entries: Vec<DdnsLogEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DdnsRecordSyncResult {
+    pub record_type: String,
+    pub domains: Vec<String>,
+    pub old_ip: Option<String>,
+    pub new_ip: Option<String>,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DdnsSyncResponse {
+    pub started_at: String,
+    pub finished_at: String,
+    pub records: Vec<DdnsRecordSyncResult>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DdnsEvent {
+    pub provider: String,
+    pub record_type: String,
+    pub domains: Vec<String>,
+    pub old_ip: Option<String>,
+    pub new_ip: Option<String>,
+    pub status: String,
+    pub message: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WlanStatusResponse {
+    pub available: bool,
+    pub enabled: bool,
+    pub hardware_enabled: bool,
+    pub interface_name: Option<String>,
+    pub connected: bool,
+    pub ssid: Option<String>,
+    pub connection_id: Option<String>,
+    pub ipv4_addresses: Vec<String>,
+    pub ipv4_gateway: Option<String>,
+    pub ipv6_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WlanNetwork {
+    pub ssid: String,
+    pub bssid: String,
+    pub signal: u8,
+    pub security: String,
+    pub secure: bool,
+    pub connected: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct WlanScanResponse {
+    pub networks: Vec<WlanNetwork>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WlanSavedNetwork {
+    pub id: String,
+    pub uuid: String,
+    pub ssid: String,
+    pub interface_name: Option<String>,
+    pub active: bool,
+    pub auto_join: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct WlanProfilesResponse {
+    pub profiles: Vec<WlanSavedNetwork>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WlanEnabledRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WlanConnectRequest {
+    pub ssid: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_true_bool")]
+    pub auto_join: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WlanProfileRequest {
+    pub connection_id: String,
+    #[serde(default)]
+    pub auto_join: Option<bool>,
+    #[serde(default)]
+    pub ipv4_mode: Option<String>,
+    #[serde(default)]
+    pub ipv4_address: Option<String>,
+    #[serde(default)]
+    pub ipv4_prefix: Option<u8>,
+    #[serde(default)]
+    pub ipv4_gateway: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WlanForgetRequest {
+    #[serde(default)]
+    pub uuid: String,
+    #[serde(default)]
+    pub connection_id: String,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CpuLoadInfo {
     pub load_1min: f64,
     pub load_5min: f64,

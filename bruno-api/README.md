@@ -102,6 +102,22 @@
 - **get_apn_list.bru** - 获取 APN 配置列表
 - **set_apn.bru** - 设置 APN 配置
 
+### 设备网络接口
+- **get_device_ddns_config.bru** - 获取 DDNS 配置
+- **set_device_ddns_config.bru** - 保存 DDNS 配置
+- **get_device_ddns_status.bru** - 获取 DDNS 状态
+- **post_device_ddns_sync.bru** - 立即执行 DDNS 同步
+- **get_device_ddns_logs.bru** - 获取 DDNS 同步日志
+- **post_device_ddns_logs_clear.bru** - 清空 DDNS 同步日志
+- **get_device_wlan_status.bru** - 获取 WLAN 状态
+- **post_device_wlan_scan.bru** - 扫描 WLAN 热点
+- **get_device_wlan_profiles.bru** - 获取已保存 WLAN 网络
+- **post_device_wlan_forget.bru** - 忘记已保存 WLAN 网络
+- **post_device_wlan_connect.bru** - 连接 WLAN 热点
+- **post_device_wlan_disconnect.bru** - 断开 WLAN
+- **post_device_wlan_profile.bru** - 保存 WLAN 配置
+- **set_device_wlan_enabled.bru** - 开关 WLAN
+
 ### 通话记录接口
 - **get_call_history.bru** - 获取通话记录列表（分页）
 - **delete_call_history.bru** - 删除单条通话记录
@@ -183,6 +199,20 @@
 | POST | `/api/call/settings` | 设置通话设置 |
 | GET | `/api/apn` | 获取 APN 配置列表 |
 | POST | `/api/apn` | 设置 APN 配置 |
+| GET | `/api/device-network/ddns/config` | 获取 DDNS 配置 |
+| POST | `/api/device-network/ddns/config` | 保存 DDNS 配置 |
+| GET | `/api/device-network/ddns/status` | 获取 DDNS 状态 |
+| POST | `/api/device-network/ddns/sync` | 立即执行 DDNS 同步 |
+| GET | `/api/device-network/ddns/logs` | 获取 DDNS 同步日志 |
+| POST | `/api/device-network/ddns/logs/clear` | 清空 DDNS 同步日志 |
+| GET | `/api/device-network/wlan/profiles` | 获取已保存 WLAN 网络 |
+| POST | `/api/device-network/wlan/forget` | 忘记已保存 WLAN 网络 |
+| GET | `/api/device-network/wlan/status` | 获取 WLAN 状态 |
+| POST | `/api/device-network/wlan/enabled` | 开关 WLAN |
+| POST | `/api/device-network/wlan/scan` | 扫描 WLAN 热点 |
+| POST | `/api/device-network/wlan/connect` | 连接 WLAN 热点 |
+| POST | `/api/device-network/wlan/disconnect` | 断开 WLAN |
+| POST | `/api/device-network/wlan/profile` | 保存 WLAN 配置 |
 | GET | `/api/call/history` | 获取通话记录列表 |
 | DELETE | `/api/call/history/:id` | 删除单条通话记录 |
 | POST | `/api/call/history/clear` | 清空所有通话记录 |

@@ -12,7 +12,8 @@ use zbus::Connection;
 use crate::cell_lock_store::CellLockStore;
 use crate::config::ConfigManager;
 use crate::db::Database;
-use crate::webhook::WebhookSender;
+use crate::device_network::DdnsManager;
+use crate::notification::NotificationSender;
 
 #[derive(Clone)]
 pub struct ActiveCallRecord {
@@ -30,10 +31,11 @@ pub struct AppState {
     pub dbus_conn: Arc<Connection>,
     /// 数据库连接（用于存储 SMS 和通话记录）
     pub database: Arc<Database>,
-    /// 配置管理器（用于管理 Webhook 等配置）
+    /// 配置管理器（用于管理通知等配置）
     pub config_manager: Arc<ConfigManager>,
-    /// Webhook 发送器（用于转发 SMS 和通话通知）
-    pub webhook_sender: Arc<WebhookSender>,
+    /// 通知发送器（用于转发 SMS、通话和 DDNS 通知）
+    pub notification_sender: Arc<NotificationSender>,
+    pub ddns_manager: Arc<DdnsManager>,
     pub active_calls: Arc<Mutex<HashMap<String, ActiveCallRecord>>>,
     /// 小区锁定 UI 状态（底层无锁网时仅内存态）
     pub cell_lock: Arc<Mutex<CellLockStore>>,
@@ -50,7 +52,8 @@ impl AppState {
         dbus_conn: Arc<Connection>,
         database: Arc<Database>,
         config_manager: Arc<ConfigManager>,
-        webhook_sender: Arc<WebhookSender>,
+        notification_sender: Arc<NotificationSender>,
+        ddns_manager: Arc<DdnsManager>,
         data_user_disabled: Arc<AtomicBool>,
         airplane_mode_requested: Arc<AtomicBool>,
         cell_monitoring_active: Arc<AtomicBool>,
@@ -59,7 +62,8 @@ impl AppState {
             dbus_conn,
             database,
             config_manager,
-            webhook_sender,
+            notification_sender,
+            ddns_manager,
             active_calls: Arc::new(Mutex::new(HashMap::new())),
             cell_lock: Arc::new(Mutex::new(CellLockStore::default())),
             data_user_disabled,
@@ -90,9 +94,15 @@ impl FromRef<AppState> for Arc<ConfigManager> {
     }
 }
 
-impl FromRef<AppState> for Arc<WebhookSender> {
+impl FromRef<AppState> for Arc<NotificationSender> {
     fn from_ref(state: &AppState) -> Self {
-        state.webhook_sender.clone()
+        state.notification_sender.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<DdnsManager> {
+    fn from_ref(state: &AppState) -> Self {
+        state.ddns_manager.clone()
     }
 }
 

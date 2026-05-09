@@ -10,6 +10,7 @@ import MainLayout from './components/Layout/MainLayout'
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const DeviceInfo = lazy(() => import('./pages/DeviceInfo'))
 const Network = lazy(() => import('./pages/Network'))
+const DeviceNetwork = lazy(() => import('./pages/DeviceNetwork'))
 const SMS = lazy(() => import('./pages/SMS'))
 const NotificationCenter = lazy(() => import('./pages/NotificationCenter'))
 const Phone = lazy(() => import('./pages/Phone'))
@@ -35,6 +36,7 @@ function App() {
               <Route index element={<Suspense fallback={<PageLoading />}><Dashboard /></Suspense>} />
               <Route path="device" element={<Suspense fallback={<PageLoading />}><DeviceInfo /></Suspense>} />
               <Route path="network" element={<Suspense fallback={<PageLoading />}><Network /></Suspense>} />
+              <Route path="device-network" element={<Suspense fallback={<PageLoading />}><DeviceNetwork /></Suspense>} />
               {/* 旧路由重定向到网络状态页面 */}
               <Route path="network-interfaces" element={<Navigate to="/network" replace />} />
               <Route path="band-lock" element={<Navigate to="/network" replace />} />

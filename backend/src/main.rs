@@ -27,23 +27,25 @@ use zbus::Connection;
 mod cell_lock_store;
 mod config;
 mod db;
+mod device_network;
 mod handlers;
 mod iptables;
 mod models;
 mod modem_manager;
+mod notification;
 mod ota;
 mod serial;
 mod sms_listener;
 mod state;
 mod utils;
-mod webhook;
 
 use config::{get_default_config_path, ConfigManager};
 use db::Database;
+use device_network::DdnsManager;
 use handlers::*;
 use modem_manager::{ensure_networkmanager_wwan_unmanaged, init_data_connection};
+use notification::NotificationSender;
 use state::AppState;
-use webhook::WebhookSender;
 
 /// 获取二进制文件同级目录下的 www 目录路径
 fn get_www_dir() -> PathBuf {
@@ -169,16 +171,40 @@ async fn main() -> Result<()> {
     let nm_result = ensure_networkmanager_wwan_unmanaged().await;
     tracing::info!(result = %nm_result, "NetworkManager modem ownership check completed");
 
-    // 初始化 Webhook 发送器
-    let webhook_sender = Arc::new(WebhookSender::new(Arc::clone(&config_manager)));
+    // 初始化通知发送器
+    let notification_sender = Arc::new(NotificationSender::new(Arc::clone(&config_manager)));
+    let ddns_manager = Arc::new(DdnsManager::new());
+
+    {
+        let ddns_manager_clone = Arc::clone(&ddns_manager);
+        let config_clone = Arc::clone(&config_manager);
+        let notification_clone = Arc::clone(&notification_sender);
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            loop {
+                let config = config_clone.get_ddns_config();
+                let interval = config.interval_seconds.max(60);
+                if config.enabled {
+                    if let Err(err) = ddns_manager_clone
+                        .sync_now(Arc::clone(&config_clone), Arc::clone(&notification_clone))
+                        .await
+                    {
+                        tracing::warn!(error = %err, "DDNS background sync failed");
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            }
+        });
+    }
 
     // 启动 SMS 监听线程
     {
         let conn_clone = Connection::system().await?;
         let db_clone = Arc::clone(&app_db);
-        let webhook_clone = Arc::clone(&webhook_sender);
+        let notification_clone = Arc::clone(&notification_sender);
         tokio::spawn(async move {
-            let _ = sms_listener::start_sms_listener(conn_clone, db_clone, webhook_clone).await;
+            let _ =
+                sms_listener::start_sms_listener(conn_clone, db_clone, notification_clone).await;
         });
     }
 
@@ -231,7 +257,8 @@ async fn main() -> Result<()> {
         dbus_conn,
         app_db,
         config_manager,
-        webhook_sender,
+        notification_sender,
+        ddns_manager,
         data_user_disabled,
         airplane_mode_requested,
         cell_monitoring_active,
@@ -272,6 +299,60 @@ async fn main() -> Result<()> {
         .route(
             "/api/network/interfaces",
             get(get_network_interfaces_info).options(options_handler),
+        )
+        .route(
+            "/api/device-network/ddns/config",
+            get(get_device_ddns_config_handler)
+                .post(set_device_ddns_config_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/device-network/ddns/status",
+            get(get_device_ddns_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/ddns/sync",
+            post(sync_device_ddns_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/ddns/logs",
+            get(get_device_ddns_logs_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/ddns/logs/clear",
+            post(clear_device_ddns_logs_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/status",
+            get(get_device_wlan_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/enabled",
+            post(set_device_wlan_enabled_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/scan",
+            post(scan_device_wlan_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/profiles",
+            get(get_device_wlan_profiles_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/forget",
+            post(forget_device_wlan_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/connect",
+            post(connect_device_wlan_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/disconnect",
+            post(disconnect_device_wlan_handler).options(options_handler),
+        )
+        .route(
+            "/api/device-network/wlan/profile",
+            post(save_device_wlan_profile_handler).options(options_handler),
         )
         .route(
             "/api/network/signal-strength",

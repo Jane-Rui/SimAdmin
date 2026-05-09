@@ -53,7 +53,7 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 当前项目由 Rust 后端和 React 前端组成：
 
 - 后端：Rust + Axum + zbus，主要通过 ModemManager D-Bus 接口管理 modem，并在部分场景使用 `mmcli`、`qmicli` 或 AT 直连兜底。
-- 前端：React + Vite + Material UI，提供仪表盘、设备信息、网络管理、短信、通知配置和 OTA 更新页面。
+- 前端：React + Vite + Material UI，提供仪表盘、设备信息、蜂窝网络、设备网络、短信、通知配置和 OTA 更新页面。
 - 部署形态：后端二进制同进程托管前端 SPA，默认安装到 `/opt/simadmin`，通过 systemd 运行。
 
 健康检查整体按支持 ModemManager 的 Linux 蜂窝设备组织，不同 modem 固件、内核、ModemManager 版本暴露的能力不同，具体功能以实际设备为准。
@@ -302,7 +302,8 @@ journalctl -u simadmin -f
 |------|------|------|
 | 仪表盘 | `/` | 在线状态、运营商、信号、网络延迟、数据/漫游/飞行模式快捷开关、系统资源、温度、流量 |
 | 设备信息 | `/device` | IMEI、厂商、型号、固件、SIM、系统信息 |
-| 网络管理 | `/network` | 网络注册、服务小区和邻区、运营商扫描、APN、射频模式、频段锁定、小区锁定状态 |
+| 蜂窝网络 | `/network` | 网络注册、服务小区和邻区、运营商扫描、APN、射频模式、频段锁定、小区锁定状态 |
+| 设备网络 | `/device-network` | WLAN 客户端联网、无线网络扫描和连接、DDNS 动态解析配置和同步日志 |
 | 短信管理 | `/sms` | 发送短信、短信列表、会话、统计、清空 |
 | 通知中心 | `/notifications` | 多渠道通知配置、短信转发模板、测试发送 |
 | 系统配置 | `/config` | 设备操作、数据连接、漫游、飞行模式、基带重启、服务重启、系统重启等 |
@@ -317,12 +318,49 @@ journalctl -u simadmin -f
 - 数据连接 watchdog，每 15 秒检查连接状态、iptables 规则和 modem 可用性。
 - ModemManager 丢失时触发 `mmcli --scan-modems`，连续失败后重启 ModemManager。
 - NetworkManager `wwan*` unmanaged 配置。
+- 设备侧 WLAN 客户端连接管理，通过 NetworkManager/nmcli 扫描和连接无线局域网，WLAN 在线时优先作为设备默认出口。
+- 原生 DDNS 同步，支持腾讯云 DNSPod、阿里云 AliDNS 和 Cloudflare，支持 IPv4/IPv6 独立配置、API/网卡取 IP 和变更/失败事件通知；默认通过网卡取 IP，可切换为内置多接口 API fallback。
 - 短信发送、接收监听、SQLite 持久化和多渠道通知转发。
 - APN 列表读取和 APN 修改。
 - 运营商列表、扫描、手动注册、自动注册。
 - OTA 上传、在线下载、校验、替换二进制和前端资源。
 
 ## 🚀 版本更新记录
+
+### 📌 v1.0.3
+
+#### ✨ 新增功能
+
+- 新增“设备网络”模块，用于配置设备侧 WLAN 客户端联网、 DDNS 动态解析，以及后期其他高级功能的扩充。
+- 新增设备侧 WLAN 管理能力：
+  - 开启 / 关闭 WLAN。
+  - 扫描附近无线网络。
+  - 连接、断开和忘记已保存 WLAN。
+  - 保存自动加入和 IPv4 地址配置。
+- 新增原生 DDNS 同步能力：
+  - 支持腾讯云 DNSPod、阿里云 AliDNS 和 Cloudflare。
+  - 支持 IPv4 / IPv6 独立解析配置。
+  - 支持通过网卡或多接口 API 获取公网 IP。
+  - 支持立即同步、后台周期同步、同步状态和最近 50 条运行日志。
+- DDNS 变更和失败事件接入通知中心，可按通知渠道独立开启“DDNS 变更”转发。
+
+#### 💫 体验优化
+
+- 侧边栏和页面分为“蜂窝网络”和“设备网络”，职责更清晰。
+- OTA 更新页面优化待安装更新和验证结果展示，在线更新支持 GitHub Release 检查、下载加速节点和下载进度。
+- 仪表盘温度展示改为冷到热连续热力色，并同时标识最低和最高温度探头。
+
+#### 🐞 bug 修复
+
+- 运营商扫描和手动 / 自动注册增加超时处理，避免 ModemManager D-Bus 调用长时间阻塞。
+- 数据连接 watchdog 增强长时间 `searching` 状态恢复逻辑，可自动尝试重新注册或循环射频状态。
+- 注册遇到 QMI network selection internal 类错误时统一走射频恢复流程，减少注册异常后的卡死概率。
+
+#### 📚 接口与文档更新
+
+- 新增设备网络 API 文档和 Bruno 示例，覆盖 DDNS 配置、状态、同步、日志以及 WLAN 状态、扫描、连接、断开、忘记和配置保存。
+- API 契约新增 DDNS、WLAN 和 DDNS 同步日志相关类型。
+- 配置持久化新增 `device_network.ddns`，通知渠道配置新增 `forward_ddns`。
 
 ### 📌 v1.0.2
 
@@ -573,6 +611,19 @@ busctl introspect org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1/M
 | `/api/cell-monitor/start` | POST | 启动小区监控 |
 | `/api/cell-monitor/stop` | POST | 停止小区监控 |
 | `/api/network/interfaces` | GET | 网络接口、IP、流量统计 |
+| `/api/device-network/ddns/config` | GET/POST | DDNS 配置读取和保存 |
+| `/api/device-network/ddns/status` | GET | DDNS 当前状态和最近同步结果 |
+| `/api/device-network/ddns/sync` | POST | 立即执行 DDNS 同步 |
+| `/api/device-network/ddns/logs` | GET | 最近 50 条 DDNS 同步日志 |
+| `/api/device-network/ddns/logs/clear` | POST | 清空 DDNS 同步日志 |
+| `/api/device-network/wlan/status` | GET | WLAN 设备、开关、连接和 IP 状态 |
+| `/api/device-network/wlan/enabled` | POST | 开启或关闭设备 WLAN |
+| `/api/device-network/wlan/scan` | POST | 扫描附近 WLAN 热点 |
+| `/api/device-network/wlan/profiles` | GET | 获取已保存 WLAN 网络 |
+| `/api/device-network/wlan/forget` | POST | 忘记已保存 WLAN 网络 |
+| `/api/device-network/wlan/connect` | POST | 连接指定 WLAN 热点 |
+| `/api/device-network/wlan/disconnect` | POST | 断开当前 WLAN 连接 |
+| `/api/device-network/wlan/profile` | POST | 保存 WLAN 自动加入和 IPv4 配置 |
 | `/api/network/signal-strength` | GET | 信号强度 |
 | `/api/location/cell-info` | GET | 基站定位参数 |
 | `/api/network/operators` | GET | 当前和已知运营商 |
@@ -662,7 +713,7 @@ www/
 
 ```json
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "commit": "abcdef0",
   "build_time": "2026-05-06T00:00:00Z",
   "binary_md5": "md5-of-binary",
@@ -724,6 +775,7 @@ SQLite 数据库保存：
 - 通知中心配置。
 - 是否允许漫游。
 - 数据连接是否由用户启用。
+- 设备网络 DDNS 配置。
 
 ### 版本注入
 
@@ -768,6 +820,7 @@ SQLite 数据库保存：
 
 - `ModemManager`
 - `mmcli`
+- `NetworkManager` / `nmcli`
 - `qmicli`
 - `iptables` / `ip6tables`
 - `systemctl`
@@ -781,4 +834,6 @@ GNU General Public License v3.0
 
 ## 🎖️ 鸣谢
 
-> 本项目基于开源项目 `1orz/project-cpe` 进行深度重构适配和二次开发，在此向原作者、贡献者及开源社区致以诚挚谢意。
+> - 本项目基于开源项目 `1orz/project-cpe` 进行深度重构适配和二次开发，在此向原作者、贡献者及开源社区致以诚挚谢意。
+
+> - 项目 DDNS 功能设计参考了开源项目 `jeessy2/ddns-go`。`ddns-go` 是一个简单易用的动态 DNS 工具，支持阿里云、腾讯云 DNSPod、Cloudflare 等多个主流解析服务商，为动态公网 IP 场景下的域名自动解析提供了成熟实践，特此致谢。

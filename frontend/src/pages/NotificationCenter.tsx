@@ -43,7 +43,9 @@ import {
 import { api, type NotificationChannelKey, type NotificationConfig } from '../api/current'
 import {
   DEFAULT_CALL_TEMPLATE,
+  DEFAULT_DDNS_TEMPLATE,
   DEFAULT_PLAIN_CALL_TEMPLATE,
+  DEFAULT_PLAIN_DDNS_TEMPLATE,
   DEFAULT_PLAIN_SMS_TEMPLATE,
   DEFAULT_SMS_TEMPLATE,
 } from '../api/current'
@@ -102,6 +104,18 @@ const CALL_TEMPLATE_VARIABLES = [
   { label: '通话方向', displayToken: '{{通话方向}}', backendToken: '{{direction}}' },
 ] as const
 
+const DDNS_TEMPLATE_VARIABLES = [
+  { label: '域名', displayToken: '{{域名}}', backendToken: '{{domains}}' },
+  { label: 'IP类型', displayToken: '{{IP类型}}', backendToken: '{{ip_type}}' },
+  { label: '新IP', displayToken: '{{新IP}}', backendToken: '{{new_ip}}' },
+  { label: '旧IP', displayToken: '{{旧IP}}', backendToken: '{{old_ip}}' },
+  { label: '服务商', displayToken: '{{服务商}}', backendToken: '{{provider}}' },
+  { label: '记录类型', displayToken: '{{记录类型}}', backendToken: '{{record_type}}' },
+  { label: '状态', displayToken: '{{状态}}', backendToken: '{{status}}' },
+  { label: '消息', displayToken: '{{消息}}', backendToken: '{{message}}' },
+  { label: '更新时间', displayToken: '{{更新时间}}', backendToken: '{{timestamp}}' },
+] as const
+
 function replaceAll(input: string, search: string, replacement: string) {
   return input.split(search).join(replacement)
 }
@@ -122,16 +136,20 @@ function toBackendTemplate(template: string, variables: readonly { displayToken:
 
 const DEFAULT_SMS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_SMS_TEMPLATE, SMS_TEMPLATE_VARIABLES)
 const DEFAULT_CALL_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_CALL_TEMPLATE, CALL_TEMPLATE_VARIABLES)
+const DEFAULT_DDNS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_DDNS_TEMPLATE, DDNS_TEMPLATE_VARIABLES)
 const DEFAULT_PLAIN_SMS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_PLAIN_SMS_TEMPLATE, SMS_TEMPLATE_VARIABLES)
 const DEFAULT_PLAIN_CALL_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_PLAIN_CALL_TEMPLATE, CALL_TEMPLATE_VARIABLES)
+const DEFAULT_PLAIN_DDNS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_PLAIN_DDNS_TEMPLATE, DDNS_TEMPLATE_VARIABLES)
 
 function baseMessageConfig() {
   return {
     enabled: false,
     forward_sms: true,
     forward_calls: true,
+    forward_ddns: true,
     sms_template: DEFAULT_PLAIN_SMS_DISPLAY_TEMPLATE,
     call_template: DEFAULT_PLAIN_CALL_DISPLAY_TEMPLATE,
+    ddns_template: DEFAULT_PLAIN_DDNS_DISPLAY_TEMPLATE,
   }
 }
 
@@ -142,10 +160,12 @@ function createDefaultNotificationConfig(): NotificationConfig {
       url: '',
       forward_sms: true,
       forward_calls: true,
+      forward_ddns: false,
       headers: {},
       secret: '',
       sms_template: DEFAULT_SMS_DISPLAY_TEMPLATE,
       call_template: DEFAULT_CALL_DISPLAY_TEMPLATE,
+      ddns_template: DEFAULT_DDNS_DISPLAY_TEMPLATE,
     },
     bark: {
       ...baseMessageConfig(),
@@ -208,19 +228,21 @@ function createDefaultNotificationConfig(): NotificationConfig {
   }
 }
 
-function withTemplateDisplay<T extends { sms_template: string; call_template: string }>(channel: T): T {
+function withTemplateDisplay<T extends { sms_template: string; call_template: string; ddns_template: string }>(channel: T): T {
   return {
     ...channel,
     sms_template: toDisplayTemplate(channel.sms_template, SMS_TEMPLATE_VARIABLES),
     call_template: toDisplayTemplate(channel.call_template, CALL_TEMPLATE_VARIABLES),
+    ddns_template: toDisplayTemplate(channel.ddns_template, DDNS_TEMPLATE_VARIABLES),
   }
 }
 
-function withTemplateBackend<T extends { sms_template: string; call_template: string }>(channel: T): T {
+function withTemplateBackend<T extends { sms_template: string; call_template: string; ddns_template: string }>(channel: T): T {
   return {
     ...channel,
     sms_template: toBackendTemplate(channel.sms_template, SMS_TEMPLATE_VARIABLES),
     call_template: toBackendTemplate(channel.call_template, CALL_TEMPLATE_VARIABLES),
+    ddns_template: toBackendTemplate(channel.ddns_template, DDNS_TEMPLATE_VARIABLES),
   }
 }
 
@@ -254,6 +276,7 @@ function normalizeNotificationConfig(config?: NotificationConfig): NotificationC
       ...merged.webhook,
       sms_template: webhookSmsTemplate,
       call_template: webhookCallTemplate,
+      ddns_template: merged.webhook.ddns_template,
     }),
     bark: withTemplateDisplay(merged.bark),
     wecom_app: withTemplateDisplay(merged.wecom_app),
@@ -314,6 +337,7 @@ export default function NotificationCenterPage() {
   const [newHeaderKey, setNewHeaderKey] = useState('')
   const [newHeaderValue, setNewHeaderValue] = useState('')
   const smsTemplateInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const ddnsTemplateInputRef = useRef<HTMLTextAreaElement | null>(null)
 
   const loadConfig = useCallback(async () => {
     setLoading(true)
@@ -396,6 +420,21 @@ export default function NotificationCenterPage() {
     })
   }
 
+  const handleInsertDdnsVariable = (displayToken: string) => {
+    const input = ddnsTemplateInputRef.current
+    const template = selectedConfig.ddns_template
+    const selectionStart = input?.selectionStart ?? template.length
+    const selectionEnd = input?.selectionEnd ?? template.length
+    const nextTemplate = `${template.slice(0, selectionStart)}${displayToken}${template.slice(selectionEnd)}`
+    patchChannel(selectedChannel, { ddns_template: nextTemplate })
+
+    window.requestAnimationFrame(() => {
+      input?.focus()
+      const nextCursor = selectionStart + displayToken.length
+      input?.setSelectionRange(nextCursor, nextCursor)
+    })
+  }
+
   const handleSave = async () => {
     setSaving(true)
     setError(null)
@@ -446,6 +485,16 @@ export default function NotificationCenterPage() {
           />
         }
         label="转发短信"
+      />
+      <FormControlLabel
+        control={
+          <Switch
+            checked={config[channel].forward_ddns}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => patchChannel(channel, { forward_ddns: event.target.checked })}
+            disabled={!config[channel].enabled}
+          />
+        }
+        label="DDNS 变更"
       />
       {/*
       <FormControlLabel
@@ -514,6 +563,58 @@ export default function NotificationCenterPage() {
         disabled={!config[channel].enabled}
       >
         重置为默认模板
+      </Button>
+
+      <Divider sx={{ my: 2.5 }} />
+      <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+        {jsonTemplate ? 'DDNS Payload 模板' : 'DDNS 通知模板'}
+        {jsonTemplate && <Chip label="JSON" size="small" variant="outlined" />}
+      </Typography>
+      <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" mb={2.5}>
+        <Typography variant="body2" color="text.secondary" sx={{ mr: 0.5 }}>
+          DDNS 变量：
+        </Typography>
+        {DDNS_TEMPLATE_VARIABLES.map((variable) => (
+          <Chip
+            key={variable.displayToken}
+            label={`+ ${variable.label}`}
+            size="small"
+            variant="outlined"
+            clickable
+            disabled={!config[channel].enabled}
+            onClick={() => handleInsertDdnsVariable(variable.displayToken)}
+          />
+        ))}
+      </Box>
+      <TextField
+        fullWidth
+        label={jsonTemplate ? 'DDNS 通知 Payload' : 'DDNS 通知模板'}
+        inputRef={channel === selectedChannel ? ddnsTemplateInputRef : undefined}
+        value={config[channel].ddns_template}
+        onChange={(event: ChangeEvent<HTMLInputElement>) => patchChannel(channel, { ddns_template: event.target.value })}
+        multiline
+        rows={jsonTemplate ? 8 : 7}
+        disabled={!config[channel].enabled}
+        sx={{ mb: 2 }}
+        InputProps={{
+          sx: {
+            fontFamily: 'monospace',
+            fontSize: '0.85rem',
+            '& textarea': {
+              lineHeight: 1.75,
+            },
+          },
+        }}
+      />
+      <Button
+        size="small"
+        variant="outlined"
+        onClick={() => patchChannel(channel, {
+          ddns_template: channel === 'webhook' ? DEFAULT_DDNS_DISPLAY_TEMPLATE : DEFAULT_PLAIN_DDNS_DISPLAY_TEMPLATE,
+        })}
+        disabled={!config[channel].enabled}
+      >
+        重置为默认 DDNS 模板
       </Button>
     </Box>
   )

@@ -17,6 +17,10 @@ import type {
   ConnectivityCheckResponse,
   DataConnectionRequest,
   DataConnectionStatus,
+  DdnsConfig,
+  DdnsLogsResponse,
+  DdnsStatusResponse,
+  DdnsSyncResponse,
   DeviceInfo,
   ManualRegisterRequest,
   NetworkInfo,
@@ -41,6 +45,12 @@ import type {
   SmsStats,
   SystemStatsResponse,
   WebhookTestResponse,
+  WlanConnectRequest,
+  WlanForgetRequest,
+  WlanProfileRequest,
+  WlanProfilesResponse,
+  WlanScanResponse,
+  WlanStatusResponse,
 } from './types'
 
 type SmsListResponse = {
@@ -274,6 +284,89 @@ class SimAdminCurrentAPI {
 
   async getConnectivity() {
     return request<ApiResponse<ConnectivityCheckResponse>>('/connectivity')
+  }
+
+  async getDdnsConfig() {
+    return request<ApiResponse<DdnsConfig>>('/device-network/ddns/config')
+  }
+
+  async setDdnsConfig(config: DdnsConfig) {
+    return request<ApiResponse<DdnsConfig>>('/device-network/ddns/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async getDdnsStatus() {
+    return request<ApiResponse<DdnsStatusResponse>>('/device-network/ddns/status')
+  }
+
+  async syncDdnsNow() {
+    return request<ApiResponse<DdnsSyncResponse>>('/device-network/ddns/sync', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async getDdnsLogs() {
+    return request<ApiResponse<DdnsLogsResponse>>('/device-network/ddns/logs')
+  }
+
+  async clearDdnsLogs() {
+    return request<ApiResponse<Record<string, never>>>('/device-network/ddns/logs/clear', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async getWlanStatus() {
+    return request<ApiResponse<WlanStatusResponse>>('/device-network/wlan/status')
+  }
+
+  async setWlanEnabled(enabled: boolean) {
+    return request<ApiResponse<WlanStatusResponse>>('/device-network/wlan/enabled', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async scanWlan() {
+    return request<ApiResponse<WlanScanResponse>>('/device-network/wlan/scan', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async getWlanProfiles() {
+    return request<ApiResponse<WlanProfilesResponse>>('/device-network/wlan/profiles')
+  }
+
+  async forgetWlan(config: WlanForgetRequest) {
+    return request<ApiResponse<WlanProfilesResponse>>('/device-network/wlan/forget', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async connectWlan(config: WlanConnectRequest) {
+    return request<ApiResponse<WlanStatusResponse>>('/device-network/wlan/connect', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async disconnectWlan() {
+    return request<ApiResponse<WlanStatusResponse>>('/device-network/wlan/disconnect', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async saveWlanProfile(config: WlanProfileRequest) {
+    return request<ApiResponse<WlanStatusResponse>>('/device-network/wlan/profile', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
   }
 
   async sendSms(phoneNumber: string, content: string) {

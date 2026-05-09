@@ -21,6 +21,7 @@ import {
   // Phone as PhoneIcon,
   GitHub as GitHubIcon,
   SystemUpdateAlt as OtaIcon,
+  Router as RouterIcon,
 } from '@mui/icons-material'
 
 const SIDEBAR_TRANSITION = '300ms cubic-bezier(0.4, 0, 0.2, 1)'
@@ -37,7 +38,8 @@ interface SidebarProps {
 const menuItems = [
   { path: '/', label: '仪表盘', icon: DashboardIcon },
   { path: '/device', label: '设备信息', icon: DevicesIcon },
-  { path: '/network', label: '网络管理', icon: SignalIcon },
+  { path: '/network', label: '蜂窝网络', icon: SignalIcon },
+  { path: '/device-network', label: '设备网络', icon: RouterIcon },
   { path: '/sms', label: '短信管理', icon: SmsIcon },
   // { path: '/phone', label: '电话管理', icon: PhoneIcon },
   { path: '/notifications', label: '通知中心', icon: NotificationsIcon },

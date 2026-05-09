@@ -21,6 +21,8 @@ pub struct WebhookConfig {
     #[serde(default = "default_true")]
     pub forward_calls: bool,
     #[serde(default)]
+    pub forward_ddns: bool,
+    #[serde(default)]
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub secret: String, // 可选的签名密钥
@@ -28,6 +30,8 @@ pub struct WebhookConfig {
     pub sms_template: String, // 短信 payload 模板
     #[serde(default = "default_call_template")]
     pub call_template: String, // 通话 payload 模板
+    #[serde(default = "default_ddns_template")]
+    pub ddns_template: String, // DDNS payload 模板
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,10 +42,14 @@ pub struct MessageChannelConfig {
     pub forward_sms: bool,
     #[serde(default = "default_true")]
     pub forward_calls: bool,
+    #[serde(default = "default_true")]
+    pub forward_ddns: bool,
     #[serde(default = "default_plain_sms_template")]
     pub sms_template: String,
     #[serde(default = "default_plain_call_template")]
     pub call_template: String,
+    #[serde(default = "default_plain_ddns_template")]
+    pub ddns_template: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +201,49 @@ pub enum NotificationChannel {
     Telegram,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceNetworkConfig {
+    #[serde(default)]
+    pub ddns: DdnsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DdnsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ddns_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub access_id: String,
+    #[serde(default)]
+    pub access_secret: String,
+    #[serde(default = "default_ddns_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_ddns_ttl")]
+    pub ttl: u32,
+    #[serde(default)]
+    pub ipv4: DdnsIpConfig,
+    #[serde(default = "default_ddns_ipv6_config")]
+    pub ipv6: DdnsIpConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DdnsIpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ddns_get_type")]
+    pub get_type: String,
+    #[serde(default)]
+    pub interface_name: String,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -218,12 +269,26 @@ fn default_call_template() -> String {
 }"#.to_string()
 }
 
+fn default_ddns_template() -> String {
+    r#"{
+  "msg_type": "text",
+  "content": {
+    "text": "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}"
+  }
+}"#
+    .to_string()
+}
+
 fn default_plain_sms_template() -> String {
     "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}".to_string()
 }
 
 fn default_plain_call_template() -> String {
     "📞 来电通知\n号码: {{phone_number}}\n类型: {{direction}}\n时间: {{start_time}}\n时长: {{duration}}秒\n已接听: {{answered}}".to_string()
+}
+
+fn default_plain_ddns_template() -> String {
+    "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}".to_string()
 }
 
 fn default_sms_title_template() -> String {
@@ -249,10 +314,12 @@ impl Default for WebhookConfig {
             url: String::new(),
             forward_sms: true,
             forward_calls: true,
+            forward_ddns: false,
             headers: HashMap::new(),
             secret: String::new(),
             sms_template: default_sms_template(),
             call_template: default_call_template(),
+            ddns_template: default_ddns_template(),
         }
     }
 }
@@ -263,8 +330,10 @@ impl Default for MessageChannelConfig {
             enabled: false,
             forward_sms: true,
             forward_calls: true,
+            forward_ddns: true,
             sms_template: default_plain_sms_template(),
             call_template: default_plain_call_template(),
+            ddns_template: default_plain_ddns_template(),
         }
     }
 }
@@ -377,6 +446,93 @@ impl Default for NotificationConfig {
     }
 }
 
+impl Default for DeviceNetworkConfig {
+    fn default() -> Self {
+        Self {
+            ddns: DdnsConfig::default(),
+        }
+    }
+}
+
+impl Default for DdnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_ddns_provider(),
+            access_id: String::new(),
+            access_secret: String::new(),
+            interval_seconds: default_ddns_interval_seconds(),
+            ttl: default_ddns_ttl(),
+            ipv4: DdnsIpConfig {
+                enabled: true,
+                get_type: default_ddns_get_type(),
+                interface_name: String::new(),
+                urls: default_ddns_ipv4_urls(),
+                domains: Vec::new(),
+            },
+            ipv6: default_ddns_ipv6_config(),
+        }
+    }
+}
+
+impl Default for DdnsIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            get_type: default_ddns_get_type(),
+            interface_name: String::new(),
+            urls: Vec::new(),
+            domains: Vec::new(),
+        }
+    }
+}
+
+fn default_ddns_provider() -> String {
+    "tencentcloud".to_string()
+}
+
+fn default_ddns_interval_seconds() -> u64 {
+    300
+}
+
+fn default_ddns_ttl() -> u32 {
+    600
+}
+
+fn default_ddns_get_type() -> String {
+    "interface".to_string()
+}
+
+fn default_ddns_ipv4_urls() -> Vec<String> {
+    vec![
+        "https://api.ipify.org".to_string(),
+        "https://ip.3322.net".to_string(),
+        "https://4.ident.me".to_string(),
+        "https://ddns.oray.com/checkip".to_string(),
+        "https://4.ipw.cn".to_string(),
+    ]
+}
+
+fn default_ddns_ipv6_urls() -> Vec<String> {
+    vec![
+        "https://api6.ipify.org".to_string(),
+        "https://speed.neu6.edu.cn/getIP.php".to_string(),
+        "https://v6.ident.me".to_string(),
+        "https://myip6.ipip.net".to_string(),
+        "https://6.ipw.cn".to_string(),
+    ]
+}
+
+fn default_ddns_ipv6_config() -> DdnsIpConfig {
+    DdnsIpConfig {
+        enabled: false,
+        get_type: default_ddns_get_type(),
+        interface_name: String::new(),
+        urls: default_ddns_ipv6_urls(),
+        domains: Vec::new(),
+    }
+}
+
 fn default_roaming_allowed() -> bool {
     true
 }
@@ -392,6 +548,8 @@ pub struct AppConfig {
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub device_network: DeviceNetworkConfig,
     /// 是否允许蜂窝数据漫游（写入 ModemManager Simple.Connect 的 allow-roaming）
     #[serde(default = "default_roaming_allowed")]
     pub roaming_allowed: bool,
@@ -404,6 +562,7 @@ impl Default for AppConfig {
         Self {
             webhook: WebhookConfig::default(),
             notifications: NotificationConfig::default(),
+            device_network: DeviceNetworkConfig::default(),
             roaming_allowed: default_roaming_allowed(),
             data_enabled: default_data_enabled(),
         }
@@ -475,6 +634,14 @@ impl ConfigManager {
         self.config.read().unwrap().data_enabled
     }
 
+    pub fn get_device_network(&self) -> DeviceNetworkConfig {
+        self.config.read().unwrap().device_network.clone()
+    }
+
+    pub fn get_ddns_config(&self) -> DdnsConfig {
+        self.config.read().unwrap().device_network.ddns.clone()
+    }
+
     pub fn set_data_enabled(&self, enabled: bool) -> Result<(), String> {
         {
             let mut c = self.config.write().unwrap();
@@ -487,6 +654,14 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.roaming_allowed = allowed;
+        }
+        self.save()
+    }
+
+    pub fn set_ddns_config(&self, ddns: DdnsConfig) -> Result<(), String> {
+        {
+            let mut c = self.config.write().unwrap();
+            c.device_network.ddns = ddns;
         }
         self.save()
     }

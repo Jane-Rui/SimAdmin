@@ -421,10 +421,12 @@ export interface WebhookConfig {
   url: string
   forward_sms: boolean
   forward_calls: boolean
+  forward_ddns: boolean
   headers: Record<string, string>
   secret: string
   sms_template: string
   call_template: string
+  ddns_template: string
 }
 
 export type NotificationChannelKey =
@@ -441,8 +443,10 @@ export interface MessageChannelConfig {
   enabled: boolean
   forward_sms: boolean
   forward_calls: boolean
+  forward_ddns: boolean
   sms_template: string
   call_template: string
+  ddns_template: string
 }
 
 export interface BarkConfig extends MessageChannelConfig {
@@ -528,6 +532,13 @@ export const DEFAULT_CALL_TEMPLATE = `{
   }
 }`
 
+export const DEFAULT_DDNS_TEMPLATE = `{
+  "msg_type": "text",
+  "content": {
+    "text": "SimAdmin DDNS 通知\\n域名: {{domains}}\\nIP类型: {{ip_type}}\\n新IP: {{new_ip}}\\n旧IP: {{old_ip}}\\n服务商: {{provider}}\\n记录类型: {{record_type}}\\n状态: {{status}}\\n消息: {{message}}\\n更新时间: {{timestamp}}"
+  }
+}`
+
 export const DEFAULT_PLAIN_SMS_TEMPLATE = `📱 短信通知
 发送方: {{phone_number}}
 内容: {{content}}
@@ -539,6 +550,17 @@ export const DEFAULT_PLAIN_CALL_TEMPLATE = `📞 来电通知
 时间: {{start_time}}
 时长: {{duration}}秒
 已接听: {{answered}}`
+
+export const DEFAULT_PLAIN_DDNS_TEMPLATE = `SimAdmin DDNS 通知
+域名: {{domains}}
+IP类型: {{ip_type}}
+新IP: {{new_ip}}
+旧IP: {{old_ip}}
+服务商: {{provider}}
+记录类型: {{record_type}}
+状态: {{status}}
+消息: {{message}}
+更新时间: {{timestamp}}`
 
 export interface WebhookTestResponse {
   success: boolean
@@ -594,4 +616,123 @@ export interface OtaLatestReleaseResponse {
   body?: string
   html_url?: string
   assets?: OtaReleaseAsset[]
+}
+
+export type DdnsProvider = 'cloudflare' | 'alidns' | 'tencentcloud'
+export type DdnsIpGetType = 'api' | 'interface'
+
+export interface DdnsIpConfig {
+  enabled: boolean
+  get_type: DdnsIpGetType
+  interface_name: string
+  urls: string[]
+  domains: string[]
+}
+
+export interface DdnsConfig {
+  enabled: boolean
+  provider: DdnsProvider
+  access_id: string
+  access_secret: string
+  access_secret_set?: boolean
+  interval_seconds: number
+  ttl: number
+  ipv4: DdnsIpConfig
+  ipv6: DdnsIpConfig
+}
+
+export interface DdnsStatusResponse {
+  enabled: boolean
+  running: boolean
+  provider: string
+  last_sync_at?: string
+  last_ipv4?: string
+  last_ipv6?: string
+  last_message?: string
+}
+
+export interface DdnsRecordSyncResult {
+  record_type: string
+  domains: string[]
+  old_ip?: string
+  new_ip?: string
+  status: string
+  message: string
+}
+
+export interface DdnsSyncResponse {
+  started_at: string
+  finished_at: string
+  records: DdnsRecordSyncResult[]
+}
+
+export interface DdnsLogEntry {
+  timestamp: string
+  level: string
+  record_type: string
+  domains: string[]
+  message: string
+}
+
+export interface DdnsLogsResponse {
+  entries: DdnsLogEntry[]
+}
+
+export interface WlanStatusResponse {
+  available: boolean
+  enabled: boolean
+  hardware_enabled: boolean
+  interface_name?: string
+  connected: boolean
+  ssid?: string
+  connection_id?: string
+  ipv4_addresses: string[]
+  ipv4_gateway?: string
+  ipv6_addresses: string[]
+}
+
+export interface WlanNetwork {
+  ssid: string
+  bssid: string
+  signal: number
+  security: string
+  secure: boolean
+  connected: boolean
+}
+
+export interface WlanScanResponse {
+  networks: WlanNetwork[]
+}
+
+export interface WlanSavedNetwork {
+  id: string
+  uuid: string
+  ssid: string
+  interface_name?: string
+  active: boolean
+  auto_join: boolean
+}
+
+export interface WlanProfilesResponse {
+  profiles: WlanSavedNetwork[]
+}
+
+export interface WlanConnectRequest {
+  ssid: string
+  password?: string
+  auto_join?: boolean
+}
+
+export interface WlanProfileRequest {
+  connection_id: string
+  auto_join?: boolean
+  ipv4_mode?: 'dhcp' | 'auto' | 'manual'
+  ipv4_address?: string
+  ipv4_prefix?: number
+  ipv4_gateway?: string
+}
+
+export interface WlanForgetRequest {
+  uuid?: string
+  connection_id?: string
 }

@@ -51,6 +51,16 @@ const MODEM_RESTART_THRESHOLD: u32 = 5;
 const MODEM_RECOVERY_COOLDOWN_SECS: u64 = 300;
 const MODEM_DISCOVERY_TIMEOUT_SECS: u64 = 5;
 const MODEM_DISCOVERY_FAILURE_CACHE_SECS: u64 = 30;
+const OPERATOR_SCAN_REQUEST_TIMEOUT_SECS: u64 = 45;
+const OPERATOR_SCAN_CACHE_POLL_SECS: u64 = 20;
+const NETWORK_REGISTER_TIMEOUT_SECS: u64 = 45;
+const SEARCHING_REGISTER_THRESHOLD: u32 = 4;
+const SEARCHING_RADIO_RESET_THRESHOLD: u32 = 8;
+const DATA_CONNECT_RETRY_COOLDOWN_SECS: u64 = 120;
+const MM_MODEM_STATE_REGISTERED: i32 = 8;
+const MM_MODEM_STATE_DISCONNECTING: i32 = 9;
+const MM_MODEM_STATE_CONNECTING: i32 = 10;
+const MM_MODEM_STATE_CONNECTED: i32 = 11;
 
 type InterfaceProperties = HashMap<String, OwnedValue>;
 type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperties>>;
@@ -1070,6 +1080,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn treats_only_data_attach_transitions_as_connection_in_progress() {
+        assert!(!data_connection_transition_in_progress(
+            MM_MODEM_STATE_REGISTERED
+        ));
+        assert!(data_connection_transition_in_progress(
+            MM_MODEM_STATE_DISCONNECTING
+        ));
+        assert!(data_connection_transition_in_progress(
+            MM_MODEM_STATE_CONNECTING
+        ));
+        assert!(!data_connection_transition_in_progress(
+            MM_MODEM_STATE_CONNECTED
+        ));
+    }
+
+    #[test]
     fn parses_qmicli_lte_intra_and_interfrequency_cells() {
         let output = r#"Intrafrequency LTE Info
         Tracking Area Code: '9611'
@@ -1652,10 +1678,29 @@ pub async fn set_data_connection(
         let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM_SIMPLE).await?;
 
         if active {
+            let state = modem_state(conn, &modem_path).await?;
+            if state >= MM_MODEM_STATE_CONNECTED {
+                info!(
+                    state = mm_state_to_string(state),
+                    "Data connection already active, skipping duplicate connect"
+                );
+                return Ok(());
+            }
+            if data_connection_transition_in_progress(state) {
+                info!(
+                    state = mm_state_to_string(state),
+                    "Data connection transition in progress, skipping duplicate connect"
+                );
+                return Ok(());
+            }
+
+            // 连接前清理残余 Bearer，防止历史 BUG 残留的 PDP Context 占用资源
+            disconnect_known_bearers(conn, &modem_path).await;
+
             let mut props: HashMap<String, Value<'_>> = HashMap::new();
             props.insert("allow-roaming".to_string(), Value::new(allow_roaming));
-            let _: OwnedObjectPath = proxy.call("Connect", &(props,)).await?;
-            info!(allow_roaming, "Data connection established");
+            let bearer: OwnedObjectPath = proxy.call("Connect", &(props,)).await?;
+            info!(allow_roaming, bearer = %bearer, "Data connection activation requested");
         } else {
             let root_path = zbus::zvariant::ObjectPath::try_from("/").unwrap();
             if let Err(err) = proxy.call::<_, _, ()>("Disconnect", &(root_path,)).await {
@@ -1679,7 +1724,7 @@ pub async fn set_data_connection(
 pub async fn get_data_connection_status(conn: &Connection) -> zbus::Result<bool> {
     let modem_path = find_modem_path(conn).await?;
     let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    Ok(modem_props.get("State").map(extract_i32).unwrap_or(0) >= 11)
+    Ok(modem_props.get("State").map(extract_i32).unwrap_or(0) >= MM_MODEM_STATE_CONNECTED)
 }
 
 async fn disconnect_known_bearers(conn: &Connection, modem_path: &str) {
@@ -1760,8 +1805,21 @@ async fn modem_state(conn: &Connection, modem_path: &str) -> zbus::Result<i32> {
         .map(|value| extract_i32(&value))
 }
 
+async fn modem_registration_state(conn: &Connection, modem_path: &str) -> zbus::Result<u32> {
+    get_property(conn, modem_path, MM_MODEM_3GPP, "RegistrationState")
+        .await
+        .map(|value| extract_u32(&value))
+}
+
 fn modem_state_is_transient(state: i32) -> bool {
     matches!(state, 0 | 1 | 4 | 5 | 9 | 10)
+}
+
+fn data_connection_transition_in_progress(state: i32) -> bool {
+    matches!(
+        state,
+        MM_MODEM_STATE_DISCONNECTING | MM_MODEM_STATE_CONNECTING
+    )
 }
 
 async fn wait_for_modem_state<F>(
@@ -1988,27 +2046,23 @@ async fn set_modem_enabled(
     wait_for_modem_state(conn, modem_path, Duration::from_secs(15), desired_ready).await
 }
 
-async fn recover_after_registration_internal_error(
+async fn recover_after_registration_failure(
     conn: &Connection,
     modem_path: &str,
     original_error: String,
 ) -> Result<(), String> {
     set_modem_enabled(conn, modem_path, false)
         .await
-        .map_err(|err| {
-            format!("{original_error}；自动注册触发 QMI Internal，且关闭射频失败：{err}")
-        })?;
+        .map_err(|err| format!("{original_error}；注册失败后关闭射频失败：{err}"))?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     set_modem_enabled(conn, modem_path, true)
         .await
-        .map_err(|err| {
-            format!("{original_error}；自动注册触发 QMI Internal，且重新启用射频失败：{err}")
-        })?;
+        .map_err(|err| format!("{original_error}；注册失败后重新启用射频失败：{err}"))?;
 
     match wait_for_radio_search(conn, modem_path, Duration::from_secs(60)).await {
         Ok(_) => Ok(()),
         Err(err) => Err(format!(
-            "{original_error}；已尝试重置射频但仍无法搜网：{err}；已禁止自动热重启，请稍后重试或手动断电重启"
+            "{original_error}；已尝试重置射频但仍无法搜网：{err}；请稍后重试或手动断电重启"
         )),
     }
 }
@@ -2244,8 +2298,22 @@ pub async fn get_operators_list(conn: &Connection) -> zbus::Result<OperatorListR
 pub async fn scan_operators(conn: &Connection) -> zbus::Result<OperatorListResponse> {
     let modem_path = find_modem_path(conn).await?;
     let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM_3GPP).await?;
-    let _ = proxy.call::<_, _, ()>("Scan", &()).await;
-    for _ in 0..90 {
+    match tokio::time::timeout(
+        Duration::from_secs(OPERATOR_SCAN_REQUEST_TIMEOUT_SECS),
+        proxy.call::<_, _, ()>("Scan", &()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!(error = %err, "Operator scan request failed"),
+        Err(_) => warn!(
+            timeout_secs = OPERATOR_SCAN_REQUEST_TIMEOUT_SECS,
+            "Operator scan request timed out"
+        ),
+    }
+
+    let polls = OPERATOR_SCAN_CACHE_POLL_SECS / 2;
+    for _ in 0..polls {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if let Ok(v) = get_property(conn, &modem_path, MM_MODEM_3GPP, "AvailableNetworks").await {
             let parsed = parse_available_networks_value(&v);
@@ -2264,23 +2332,40 @@ pub async fn scan_operators(conn: &Connection) -> zbus::Result<OperatorListRespo
     get_operators_list(conn).await
 }
 
+async fn register_operator_on_modem(
+    conn: &Connection,
+    modem_path: &str,
+    mccmnc: &str,
+) -> Result<(), String> {
+    let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM_3GPP)
+        .await
+        .map_err(|err| err.to_string())?;
+    let network_id = mccmnc.to_string();
+    let args = (network_id,);
+    match tokio::time::timeout(
+        Duration::from_secs(NETWORK_REGISTER_TIMEOUT_SECS),
+        proxy.call::<_, _, ()>("Register", &args),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "Network registration request timed out after {NETWORK_REGISTER_TIMEOUT_SECS}s"
+        )),
+    }
+}
+
 pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> Result<(), String> {
     with_serial(async {
         let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
-        let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM_3GPP)
-            .await
-            .map_err(|err| err.to_string())?;
-        match proxy
-            .call::<_, _, ()>("Register", &(mccmnc.to_string(),))
-            .await
-        {
+        match register_operator_on_modem(conn, &modem_path, mccmnc).await {
             Ok(()) => Ok(()),
             Err(err) => {
-                let message = err.to_string();
-                if is_qmi_network_selection_internal_error(&message) {
-                    recover_after_registration_internal_error(conn, &modem_path, message).await
+                if is_qmi_network_selection_internal_error(&err) {
+                    recover_after_registration_failure(conn, &modem_path, err).await
                 } else {
-                    Err(message)
+                    Err(err)
                 }
             }
         }
@@ -2291,17 +2376,13 @@ pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> Result
 pub async fn register_operator_auto(conn: &Connection) -> Result<(), String> {
     with_serial(async {
         let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
-        let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM_3GPP)
-            .await
-            .map_err(|err| err.to_string())?;
-        match proxy.call::<_, _, ()>("Register", &("".to_string(),)).await {
+        match register_operator_on_modem(conn, &modem_path, "").await {
             Ok(()) => Ok(()),
             Err(err) => {
-                let message = err.to_string();
-                if is_qmi_network_selection_internal_error(&message) {
-                    recover_after_registration_internal_error(conn, &modem_path, message).await
+                if is_qmi_network_selection_internal_error(&err) {
+                    recover_after_registration_failure(conn, &modem_path, err).await
                 } else {
-                    Err(message)
+                    Err(err)
                 }
             }
         }
@@ -3014,11 +3095,14 @@ pub async fn init_data_connection(
     };
 
     let state_text = mm_state_to_string(state);
-    if state < 8 {
+    if state < MM_MODEM_STATE_REGISTERED {
         return format!("Modem not registered (state: {state_text}), skipping auto-connect");
     }
-    if state >= 11 {
+    if state >= MM_MODEM_STATE_CONNECTED {
         return format!("Data connection already active (state: {state_text})");
+    }
+    if data_connection_transition_in_progress(state) {
+        return format!("Data connection transition in progress (state: {state_text}), waiting");
     }
 
     match set_data_connection(conn, true, allow_roaming).await {
@@ -3272,6 +3356,12 @@ pub async fn data_connection_watchdog(
     let mut missing_count = 0u32;
     let mut scan_requested_for_outage = false;
     let mut last_modem_restart_at: Option<Instant> = None;
+    let mut searching_count = 0u32;
+    let mut auto_register_requested_for_search = false;
+    let mut last_searching_recovery_at: Option<Instant> = None;
+    let mut last_data_activation_attempt_at: Option<Instant> = None;
+    let mut transition_stuck_count = 0u32;
+    const TRANSITION_STUCK_THRESHOLD: u32 = 6;
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
@@ -3307,6 +3397,13 @@ pub async fn data_connection_watchdog(
                     missing_count = 0;
                     scan_requested_for_outage = false;
                     let state = extract_i32(&value);
+                    if state != 7 {
+                        searching_count = 0;
+                        auto_register_requested_for_search = false;
+                    }
+                    if !data_connection_transition_in_progress(state) {
+                        transition_stuck_count = 0;
+                    }
                     if airplane_requested.load(Ordering::SeqCst) {
                         if state >= 6 {
                             match set_airplane_mode(&conn, true).await {
@@ -3328,20 +3425,118 @@ pub async fn data_connection_watchdog(
                             },
                             Err(err) => format!("Modem enabled but idle, disable failed: {err}"),
                         }
-                    } else if state < 8 {
+                    } else if state == 7 {
+                        searching_count += 1;
+                        let registration = modem_registration_state(&conn, &modem_path)
+                            .await
+                            .unwrap_or(0);
+                        let cooldown_active = last_searching_recovery_at
+                            .map(|at| {
+                                at.elapsed() < Duration::from_secs(MODEM_RECOVERY_COOLDOWN_SECS)
+                            })
+                            .unwrap_or(false);
+
+                        if searching_count >= SEARCHING_RADIO_RESET_THRESHOLD && !cooldown_active {
+                            last_searching_recovery_at = Some(Instant::now());
+                            searching_count = 0;
+                            auto_register_requested_for_search = false;
+                            match set_modem_enabled(&conn, &modem_path, false).await {
+                                Ok(_) => {
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                    match set_modem_enabled(&conn, &modem_path, true).await {
+                                        Ok(_) => {
+                                            "Searching for too long, cycled radio state".to_string()
+                                        }
+                                        Err(err) => {
+                                            format!(
+                                                "Searching for too long, re-enable failed: {err}"
+                                            )
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    format!("Searching for too long, disable failed: {err}")
+                                }
+                            }
+                        } else if searching_count >= SEARCHING_REGISTER_THRESHOLD
+                            && !auto_register_requested_for_search
+                        {
+                            auto_register_requested_for_search = true;
+                            match register_operator_auto(&conn).await {
+                                Ok(_) => "Searching for too long, requested automatic registration"
+                                    .to_string(),
+                                Err(err) => format!(
+                                    "Searching for too long, automatic registration failed: {err}"
+                                ),
+                            }
+                        } else if cooldown_active
+                            && searching_count >= SEARCHING_RADIO_RESET_THRESHOLD
+                        {
+                            format!(
+                                "Waiting for registration (state: searching, registration: {}, recovery cooldown active)",
+                                mm_registration_to_string(registration)
+                            )
+                        } else {
+                            format!(
+                                "Waiting for registration (state: searching, registration: {}, attempts: {searching_count})",
+                                mm_registration_to_string(registration)
+                            )
+                        }
+                    } else if state < MM_MODEM_STATE_REGISTERED {
                         format!(
                             "Waiting for registration (state: {})",
                             mm_state_to_string(state)
                         )
-                    } else if state >= 11 {
+                    } else if state >= MM_MODEM_STATE_CONNECTED {
+                        last_data_activation_attempt_at = None;
                         "Connected".to_string()
+                    } else if data_connection_transition_in_progress(state) {
+                        transition_stuck_count += 1;
+                        if transition_stuck_count >= TRANSITION_STUCK_THRESHOLD {
+                            transition_stuck_count = 0;
+                            warn!(
+                                state = mm_state_to_string(state),
+                                "Modem stuck in transition state, cycling radio"
+                            );
+                            match set_modem_enabled(&conn, &modem_path, false).await {
+                                Ok(_) => {
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                    match set_modem_enabled(&conn, &modem_path, true).await {
+                                        Ok(_) => "Transition stuck, cycled radio state".to_string(),
+                                        Err(err) => format!("Transition stuck, re-enable failed: {err}"),
+                                    }
+                                }
+                                Err(err) => format!("Transition stuck, disable failed: {err}"),
+                            }
+                        } else {
+                            format!(
+                                "Data connection transition in progress (state: {}), waiting ({}/{})",
+                                mm_state_to_string(state),
+                                transition_stuck_count,
+                                TRANSITION_STUCK_THRESHOLD
+                            )
+                        }
                     } else if user_disabled.load(Ordering::SeqCst) {
+                        last_data_activation_attempt_at = None;
                         "User disabled cellular data, not reconnecting".to_string()
                     } else {
-                        let allow_roaming = config.get_roaming_allowed();
-                        match set_data_connection(&conn, true, allow_roaming).await {
-                            Ok(_) => "Connection restored".to_string(),
-                            Err(err) => format!("Activation failed: {err}"),
+                        let cooldown_active = last_data_activation_attempt_at
+                            .map(|at| {
+                                at.elapsed() < Duration::from_secs(DATA_CONNECT_RETRY_COOLDOWN_SECS)
+                            })
+                            .unwrap_or(false);
+                        if cooldown_active {
+                            format!(
+                                "Data connection inactive (state: {}), activation retry cooldown active",
+                                mm_state_to_string(state)
+                            )
+                        } else {
+                            last_data_activation_attempt_at = Some(Instant::now());
+                            let allow_roaming = config.get_roaming_allowed();
+                            match set_data_connection(&conn, true, allow_roaming).await {
+                                Ok(_) => "Connection activation requested".to_string(),
+                                Err(err) => format!("Activation failed: {err}"),
+                            }
                         }
                     }
                 }

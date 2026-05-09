@@ -477,6 +477,295 @@ pub async fn get_network_interfaces_info() -> impl IntoResponse {
     }
 }
 
+/// GET /api/device-network/ddns/config
+pub async fn get_device_ddns_config_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let config = app.config_manager.get_ddns_config();
+    let access_secret_set = !config.access_secret.trim().is_empty();
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            ddns_config_response(config, access_secret_set),
+        )),
+    )
+}
+
+/// POST /api/device-network/ddns/config
+pub async fn set_device_ddns_config_handler(
+    State(app): State<AppState>,
+    Json(mut payload): Json<crate::config::DdnsConfig>,
+) -> impl IntoResponse {
+    let current = app.config_manager.get_ddns_config();
+    if is_masked_secret(&payload.access_id) {
+        payload.access_id = current.access_id;
+    }
+    if payload.access_secret.trim().is_empty() {
+        payload.access_secret = current.access_secret;
+    } else if is_masked_secret(&payload.access_secret) {
+        payload.access_secret = current.access_secret;
+    }
+    if payload.interval_seconds == 0 {
+        payload.interval_seconds = 300;
+    }
+    if payload.ttl == 0 {
+        payload.ttl = 600;
+    }
+
+    match app.config_manager.set_ddns_config(payload.clone()) {
+        Ok(()) => {
+            let access_secret_set = !payload.access_secret.trim().is_empty();
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "DDNS config updated",
+                    ddns_config_response(payload, access_secret_set),
+                )),
+            )
+        }
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<serde_json::Value>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+fn ddns_config_response(
+    mut config: crate::config::DdnsConfig,
+    access_secret_set: bool,
+) -> serde_json::Value {
+    config.access_id = mask_secret(&config.access_id);
+    config.access_secret = mask_secret(&config.access_secret);
+    let mut value = serde_json::to_value(config).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("access_secret_set".to_string(), json!(access_secret_set));
+    }
+    value
+}
+
+fn mask_secret(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let prefix: String = trimmed.chars().take(3).collect();
+    format!("{prefix}******")
+}
+
+fn is_masked_secret(value: &str) -> bool {
+    value.contains('*')
+}
+
+/// GET /api/device-network/ddns/status
+pub async fn get_device_ddns_status_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let config = app.config_manager.get_ddns_config();
+    let status = app.ddns_manager.status(&config).await;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", status)),
+    )
+}
+
+/// POST /api/device-network/ddns/sync
+pub async fn sync_device_ddns_handler(State(app): State<AppState>) -> impl IntoResponse {
+    match app
+        .ddns_manager
+        .sync_now(app.config_manager.clone(), app.notification_sender.clone())
+        .await
+    {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "DDNS sync completed",
+                data,
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<DdnsSyncResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// GET /api/device-network/ddns/logs
+pub async fn get_device_ddns_logs_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let logs = app.ddns_manager.logs().await;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", logs)),
+    )
+}
+
+/// POST /api/device-network/ddns/logs/clear
+pub async fn clear_device_ddns_logs_handler(State(app): State<AppState>) -> impl IntoResponse {
+    app.ddns_manager.clear_logs().await;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "DDNS logs cleared",
+            json!({}),
+        )),
+    )
+}
+
+/// GET /api/device-network/wlan/status
+pub async fn get_device_wlan_status_handler() -> impl IntoResponse {
+    match crate::device_network::wlan_status().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", data)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanStatusResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// POST /api/device-network/wlan/enabled
+pub async fn set_device_wlan_enabled_handler(
+    Json(payload): Json<WlanEnabledRequest>,
+) -> impl IntoResponse {
+    match crate::device_network::wlan_set_enabled(payload).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "WLAN state updated",
+                data,
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanStatusResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// POST /api/device-network/wlan/scan
+pub async fn scan_device_wlan_handler() -> impl IntoResponse {
+    match crate::device_network::wlan_scan().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", data)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanScanResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// GET /api/device-network/wlan/profiles
+pub async fn get_device_wlan_profiles_handler() -> impl IntoResponse {
+    match crate::device_network::wlan_profiles().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", data)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanProfilesResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// POST /api/device-network/wlan/forget
+pub async fn forget_device_wlan_handler(
+    Json(payload): Json<WlanForgetRequest>,
+) -> impl IntoResponse {
+    match crate::device_network::wlan_forget(payload).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "WLAN profile forgotten",
+                data,
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanProfilesResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// POST /api/device-network/wlan/connect
+pub async fn connect_device_wlan_handler(
+    Json(payload): Json<WlanConnectRequest>,
+) -> impl IntoResponse {
+    match crate::device_network::wlan_connect(payload).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("WLAN connected", data)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanStatusResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// POST /api/device-network/wlan/disconnect
+pub async fn disconnect_device_wlan_handler() -> impl IntoResponse {
+    match crate::device_network::wlan_disconnect().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("WLAN disconnected", data)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanStatusResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
+/// POST /api/device-network/wlan/profile
+pub async fn save_device_wlan_profile_handler(
+    Json(payload): Json<WlanProfileRequest>,
+) -> impl IntoResponse {
+    match crate::device_network::wlan_save_profile(payload).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "WLAN profile updated",
+                data,
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<WlanStatusResponse>::error(format!(
+                "Failed: {}",
+                err
+            ))),
+        ),
+    }
+}
+
 /// GET /api/network/signal-strength
 pub async fn get_signal_strength_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
     match get_signal_strength(&conn).await {
@@ -1640,7 +1929,7 @@ fn warn_reboot_prep_failure(label: &str, program: &str, severity: &str, output: 
     );
 }
 
-// ============ Webhook 配置 ============
+// ============ 通知配置 ============
 
 pub async fn restart_service_handler() -> impl IntoResponse {
     tokio::spawn(async move {
@@ -1659,7 +1948,7 @@ pub async fn restart_service_handler() -> impl IntoResponse {
 }
 
 use crate::config::ConfigManager;
-use crate::webhook::WebhookSender;
+use crate::notification::NotificationSender;
 
 /// GET /api/notifications/config
 pub async fn get_notification_config_handler(
@@ -1698,12 +1987,12 @@ pub async fn set_notification_config_handler(
 /// POST /api/notifications/test/{channel}
 pub async fn test_notification_channel_handler(
     Path(channel): Path<crate::config::NotificationChannel>,
-    State(webhook_sender): State<Arc<WebhookSender>>,
+    State(notification_sender): State<Arc<NotificationSender>>,
 ) -> (
     StatusCode,
     Json<ApiResponse<crate::models::WebhookTestResponse>>,
 ) {
-    match webhook_sender.test_channel(channel).await {
+    match notification_sender.test_channel(channel).await {
         Ok(message) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(

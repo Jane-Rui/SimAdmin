@@ -58,18 +58,44 @@ function getTempPercent(temp: number) {
   return Math.min(Math.max((temp / TEMPERATURE_DANGER_THRESHOLD) * 100, 0), 100)
 }
 
-function getTempBarColor(percent: number) {
-  const steppedPercent = Math.round(percent / 5) * 5
-  const hue = Math.max(0, 150 - steppedPercent * 2)
-  return `hsl(${hue}, 82%, 48%)`
+function getTempBarColor(currentTemp: number) {
+  const clampedTemp = Math.max(0, currentTemp)
+  const steppedTemp = Math.round(clampedTemp / 5) * 5
+
+  let hue: number
+
+  if (steppedTemp <= 50) {
+    const ratio = steppedTemp / 50
+    hue = Math.round(193 - (193 - 45) * ratio)
+  } else if (steppedTemp <= 100) {
+    const ratio = (steppedTemp - 50) / 50
+    hue = Math.round(45 - 45 * ratio)
+  } else {
+    hue = 0
+  }
+
+  return `hsl(${hue}, 84%, 60%)`
 }
 
-function getTempHeatGradient() {
+function generateHeatmapGradient() {
   const stops = []
+
   for (let percent = 0; percent <= 100; percent += 5) {
-    stops.push(`${getTempBarColor(percent)} ${percent}%`)
+    let hue: number
+    if (percent <= 50) {
+      hue = Math.round(193 - (193 - 45) * (percent / 50))
+    } else {
+      hue = Math.round(45 - 45 * ((percent - 50) / 50))
+    }
+    stops.push(`hsl(${hue}, 84%, 60%) ${percent}%`)
   }
-  return `linear-gradient(90deg, ${stops.join(', ')})`
+
+  return `linear-gradient(to right, ${stops.join(', ')})`
+}
+
+function getTempDotColor(sensor: ThermalZone | null) {
+  if (!sensor) return 'text.disabled'
+  return getTempBarColor(sensor.temperature)
 }
 
 function getFriendlyTemperatureLabel(sensor: ThermalZone) {
@@ -119,9 +145,9 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
     .filter((sensor) => Number.isFinite(sensor.temperature))
     .sort((a, b) => b.temperature - a.temperature)
   const hottestSensor = sortedTemperatureSensors[0] ?? null
-  const secondHottestSensor = sortedTemperatureSensors[1] ?? null
+  const coldestSensor = sortedTemperatureSensors.length > 0 ? sortedTemperatureSensors[sortedTemperatureSensors.length - 1] : null
   const hottestPercent = hottestSensor ? getTempPercent(hottestSensor.temperature) : 0
-  const hottestColor = getTempBarColor(hottestPercent)
+  const hottestColor = hottestSensor ? getTempBarColor(hottestSensor.temperature) : getTempBarColor(0)
   const temperatureGradientSize = hottestPercent > 0 ? `${10000 / hottestPercent}% 100%` : '100% 100%'
 
   const progressSx = {
@@ -136,7 +162,7 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
     ...progressSx,
     '& .MuiLinearProgress-bar': {
       width: `${hottestPercent}%`,
-      backgroundImage: hottestSensor ? getTempHeatGradient() : 'none',
+      backgroundImage: hottestSensor ? generateHeatmapGradient() : 'none',
       backgroundSize: temperatureGradientSize,
       backgroundPosition: 'left center',
       bgcolor: hottestSensor ? getTempBarColor(0) : theme.palette.action.disabled,
@@ -235,7 +261,7 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
             <Box>
               <Box display="flex" justifyContent="space-between" alignItems="center" mb={0.75}>
                 <Box display="flex" alignItems="center" gap={0.75}>
-                  <Thermostat fontSize="small" sx={{ color: hottestSensor ? hottestColor : 'text.secondary' }} />
+                  <Thermostat fontSize="small" sx={{ color: 'text.secondary' }} />
                   <Typography variant="caption" fontWeight={700}>最高温</Typography>
                 </Box>
                 <Typography variant="caption" fontFamily="monospace" fontWeight={700} sx={{ color: hottestSensor ? hottestColor : 'text.secondary' }}>
@@ -254,12 +280,12 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
                       width: 5,
                       height: 5,
                       borderRadius: '50%',
-                      bgcolor: hottestSensor ? '#ef4444' : 'text.disabled',
+                      bgcolor: getTempDotColor(coldestSensor),
                       flex: '0 0 auto',
                     }}
                   />
-                  <Typography variant="caption" fontFamily="monospace" noWrap sx={{ color: hottestSensor ? hottestColor : 'text.disabled' }}>
-                    {formatTemperatureSource(hottestSensor)}
+                  <Typography variant="caption" fontFamily="monospace" color="text.secondary" noWrap>
+                    {formatTemperatureSource(coldestSensor)}
                   </Typography>
                 </Box>
                 <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} minWidth={0}>
@@ -268,12 +294,12 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
                       width: 5,
                       height: 5,
                       borderRadius: '50%',
-                      bgcolor: secondHottestSensor ? getTempBarColor(getTempPercent(secondHottestSensor.temperature)) : 'text.disabled',
+                      bgcolor: getTempDotColor(hottestSensor),
                       flex: '0 0 auto',
                     }}
                   />
-                  <Typography variant="caption" fontFamily="monospace" color="text.disabled" noWrap textAlign="right">
-                    {formatTemperatureSource(secondHottestSensor)}
+                  <Typography variant="caption" fontFamily="monospace" color="text.secondary" noWrap textAlign="right">
+                    {formatTemperatureSource(hottestSensor)}
                   </Typography>
                 </Box>
               </Box>

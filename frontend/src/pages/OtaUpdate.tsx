@@ -711,64 +711,169 @@ export default function OtaUpdate() {
           </CardContent>
         </Card>
 
-        {hasPendingUpdate && pendingMeta && (
-          <Card sx={{ borderColor: 'warning.main', borderWidth: 2, borderStyle: 'solid' }}>
-            <CardContent>
-              <Box display="flex" alignItems="center" gap={1} mb={2}>
-                <Warning color="warning" />
-                <Typography variant="h6">待安装更新</Typography>
-                <Chip
-                  label={pendingMeta.version}
-                  color="warning"
-                  size="small"
-                  sx={{ ml: 1 }}
-                />
-              </Box>
-              <TableContainer>
-                <Table size="small">
-                  <TableBody>
-                    <TableRow>
-                      <TableCell component="th" sx={{ width: 150 }}>版本号</TableCell>
-                      <TableCell>{pendingMeta.version}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">Commit</TableCell>
-                      <TableCell sx={{ fontFamily: 'monospace' }}>{pendingMeta.commit}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">构建时间</TableCell>
-                      <TableCell>{formatDateTime(pendingMeta.build_time)}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">架构</TableCell>
-                      <TableCell>{pendingMeta.arch}</TableCell>
-                    </TableRow>
-                  </TableBody>
-                </Table>
-              </TableContainer>
-              <Divider sx={{ my: 2 }} />
-              <Stack direction="row" spacing={2}>
-                <Button
-                  variant="contained"
-                  color="success"
-                  startIcon={<SystemUpdateAlt />}
-                  onClick={() => setConfirmDialog('apply')}
-                  disabled={applying}
-                >
-                  {applying ? <CircularProgress size={20} /> : '应用更新'}
-                </Button>
-                <Button
-                  variant="outlined"
-                  color="error"
-                  startIcon={<Cancel />}
-                  onClick={() => setConfirmDialog('cancel')}
-                >
-                  取消更新
-                </Button>
-              </Stack>
-            </CardContent>
-          </Card>
-        )}
+        {(hasPendingUpdate && pendingMeta) || uploadResult ? (
+          <Stack direction={{ xs: 'column', md: 'row' }} spacing={3} alignItems="stretch">
+            {hasPendingUpdate && pendingMeta && (
+              <Card sx={{ flex: 1, minWidth: 0, borderColor: 'warning.main', borderWidth: 2, borderStyle: 'solid' }}>
+                <CardContent>
+                  <Box display="flex" alignItems="center" gap={1} mb={2}>
+                    <Warning color="warning" />
+                    <Typography variant="h6">待安装更新</Typography>
+                    <Chip
+                      label={pendingMeta.version}
+                      color="warning"
+                      size="small"
+                      sx={{ ml: 1 }}
+                    />
+                  </Box>
+                  <TableContainer>
+                    <Table size="small">
+                      <TableBody>
+                        <TableRow>
+                          <TableCell component="th" sx={{ width: 150 }}>版本号</TableCell>
+                          <TableCell>{pendingMeta.version}</TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">Commit</TableCell>
+                          <TableCell sx={{ wordBreak: 'break-all' }}>{pendingMeta.commit}</TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">构建时间</TableCell>
+                          <TableCell>{formatDateTime(pendingMeta.build_time)}</TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">架构</TableCell>
+                          <TableCell>{pendingMeta.arch}</TableCell>
+                        </TableRow>
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                  <Divider sx={{ my: 2 }} />
+                  <Stack direction="row" spacing={2}>
+                    <Button
+                      variant="contained"
+                      color="success"
+                      startIcon={<SystemUpdateAlt />}
+                      onClick={() => setConfirmDialog('apply')}
+                      disabled={applying}
+                    >
+                      {applying ? <CircularProgress size={20} /> : '应用更新'}
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      color="error"
+                      startIcon={<Cancel />}
+                      onClick={() => setConfirmDialog('cancel')}
+                    >
+                      取消更新
+                    </Button>
+                  </Stack>
+                </CardContent>
+              </Card>
+            )}
+
+            {uploadResult && (
+              <Card
+                sx={{
+                  flex: 1,
+                  minWidth: 0,
+                  ...(uploadResult.validation.valid
+                    ? { borderColor: 'success.main', borderWidth: 2, borderStyle: 'solid' }
+                    : {}),
+                }}
+              >
+                <CardContent>
+                  <Box display="flex" alignItems="center" gap={1} mb={2}>
+                    {uploadResult.validation.valid ? (
+                      <CheckCircle color="success" />
+                    ) : (
+                      <ErrorIcon color="error" />
+                    )}
+                    <Typography variant="h6">
+                      验证结果
+                    </Typography>
+                    <Chip
+                      label={uploadResult.validation.valid ? '通过' : '失败'}
+                      color={uploadResult.validation.valid ? 'success' : 'error'}
+                      size="small"
+                    />
+                  </Box>
+
+                  <TableContainer component={Paper} variant="outlined">
+                    <Table size="small">
+                      <TableBody>
+                        <TableRow>
+                          <TableCell component="th" sx={{ width: 180 }}>版本号</TableCell>
+                          <TableCell>{uploadResult.meta.version}</TableCell>
+                          <TableCell align="right">
+                            {uploadResult.validation.is_newer ? (
+                              <Chip label="新版本" color="success" size="small" />
+                            ) : (
+                              <Chip label="旧版本或相同" color="warning" size="small" />
+                            )}
+                          </TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">Commit</TableCell>
+                          <TableCell sx={{ wordBreak: 'break-all' }} colSpan={2}>
+                            {uploadResult.meta.commit}
+                          </TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">构建时间</TableCell>
+                          <TableCell colSpan={2}>{formatDateTime(uploadResult.meta.build_time)}</TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">二进制 MD5</TableCell>
+                          <TableCell sx={{ wordBreak: 'break-all' }}>
+                            {uploadResult.meta.binary_md5}
+                          </TableCell>
+                          <TableCell align="right">
+                            {uploadResult.validation.binary_md5_match ? (
+                              <CheckCircle color="success" fontSize="small" />
+                            ) : (
+                              <ErrorIcon color="error" fontSize="small" />
+                            )}
+                          </TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">前端 MD5</TableCell>
+                          <TableCell sx={{ wordBreak: 'break-all' }}>
+                            {uploadResult.meta.frontend_md5}
+                          </TableCell>
+                          <TableCell align="right">
+                            {uploadResult.validation.frontend_md5_match ? (
+                              <CheckCircle color="success" fontSize="small" />
+                            ) : (
+                              <ErrorIcon color="error" fontSize="small" />
+                            )}
+                          </TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell component="th">架构</TableCell>
+                          <TableCell>{uploadResult.meta.arch}</TableCell>
+                          <TableCell align="right">
+                            {uploadResult.validation.arch_match ? (
+                              <CheckCircle color="success" fontSize="small" />
+                            ) : (
+                              <ErrorIcon color="error" fontSize="small" />
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+
+                  {uploadResult.validation.error && (
+                    <Alert severity="error" sx={{ mt: 2 }}>
+                      {uploadResult.validation.error}
+                    </Alert>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+          </Stack>
+        ) : null}
 
         <Card>
           <CardContent>
@@ -965,98 +1070,6 @@ export default function OtaUpdate() {
           </CardContent>
         </Card>
 
-        {uploadResult && (
-          <Card>
-            <CardContent>
-              <Box display="flex" alignItems="center" gap={1} mb={2}>
-                {uploadResult.validation.valid ? (
-                  <CheckCircle color="success" />
-                ) : (
-                  <ErrorIcon color="error" />
-                )}
-                <Typography variant="h6">
-                  验证结果
-                </Typography>
-                <Chip
-                  label={uploadResult.validation.valid ? '通过' : '失败'}
-                  color={uploadResult.validation.valid ? 'success' : 'error'}
-                  size="small"
-                />
-              </Box>
-
-              <TableContainer component={Paper} variant="outlined">
-                <Table size="small">
-                  <TableBody>
-                    <TableRow>
-                      <TableCell component="th" sx={{ width: 180 }}>版本号</TableCell>
-                      <TableCell>{uploadResult.meta.version}</TableCell>
-                      <TableCell align="right">
-                        {uploadResult.validation.is_newer ? (
-                          <Chip label="新版本" color="success" size="small" />
-                        ) : (
-                          <Chip label="旧版本或相同" color="warning" size="small" />
-                        )}
-                      </TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">Commit</TableCell>
-                      <TableCell sx={{ fontFamily: 'monospace' }} colSpan={2}>
-                        {uploadResult.meta.commit}
-                      </TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">构建时间</TableCell>
-                      <TableCell colSpan={2}>{formatDateTime(uploadResult.meta.build_time)}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">二进制 MD5</TableCell>
-                      <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>
-                        {uploadResult.meta.binary_md5}
-                      </TableCell>
-                      <TableCell align="right">
-                        {uploadResult.validation.binary_md5_match ? (
-                          <CheckCircle color="success" fontSize="small" />
-                        ) : (
-                          <ErrorIcon color="error" fontSize="small" />
-                        )}
-                      </TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">前端 MD5</TableCell>
-                      <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>
-                        {uploadResult.meta.frontend_md5}
-                      </TableCell>
-                      <TableCell align="right">
-                        {uploadResult.validation.frontend_md5_match ? (
-                          <CheckCircle color="success" fontSize="small" />
-                        ) : (
-                          <ErrorIcon color="error" fontSize="small" />
-                        )}
-                      </TableCell>
-                    </TableRow>
-                    <TableRow>
-                      <TableCell component="th">架构</TableCell>
-                      <TableCell>{uploadResult.meta.arch}</TableCell>
-                      <TableCell align="right">
-                        {uploadResult.validation.arch_match ? (
-                          <CheckCircle color="success" fontSize="small" />
-                        ) : (
-                          <ErrorIcon color="error" fontSize="small" />
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  </TableBody>
-                </Table>
-              </TableContainer>
-
-              {uploadResult.validation.error && (
-                <Alert severity="error" sx={{ mt: 2 }}>
-                  {uploadResult.validation.error}
-                </Alert>
-              )}
-            </CardContent>
-          </Card>
-        )}
       </Stack>
 
       <Dialog open={confirmDialog === 'apply'} onClose={() => setConfirmDialog(null)}>

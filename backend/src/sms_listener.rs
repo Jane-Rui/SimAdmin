@@ -4,7 +4,7 @@
 //! 以便在部分 eSIM/国际运营商场景下尽量减少漏收。
 use crate::db::{Database, SmsMessage};
 use crate::modem_manager::find_modem_path;
-use crate::webhook::WebhookSender;
+use crate::notification::NotificationSender;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -85,7 +85,7 @@ async fn read_sms_content(conn: &Connection, sms_path: &str) -> Option<IncomingS
 async fn process_sms_path(
     conn: &Connection,
     db: &Database,
-    webhook: &Arc<WebhookSender>,
+    notification_sender: &Arc<NotificationSender>,
     modem_path: &str,
     sms_path: &str,
 ) {
@@ -127,9 +127,9 @@ async fn process_sms_path(
                 status: "received".to_string(),
                 pdu: Some(marker),
             };
-            let webhook_clone = Arc::clone(webhook);
+            let notification_sender = Arc::clone(notification_sender);
             tokio::spawn(async move {
-                let _ = webhook_clone.forward_sms(&sms).await;
+                let _ = notification_sender.forward_sms(&sms).await;
             });
 
             let conn_clone = conn.clone();
@@ -171,7 +171,7 @@ async fn process_sms_path(
 pub async fn start_sms_listener(
     conn: Connection,
     db: Arc<Database>,
-    webhook: Arc<WebhookSender>,
+    notification_sender: Arc<NotificationSender>,
 ) -> zbus::Result<()> {
     info!("Starting SMS listener (ModemManager mode)");
     loop {
@@ -234,8 +234,14 @@ pub async fn start_sms_listener(
 
                         // Give ModemManager a short moment to assemble multipart SMS content.
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        process_sms_path(&conn, &db, &webhook, modem_path.as_str(), &sms_path_str)
-                            .await;
+                        process_sms_path(
+                            &conn,
+                            &db,
+                            &notification_sender,
+                            modem_path.as_str(),
+                            &sms_path_str,
+                        )
+                        .await;
                     }
                 }
             }

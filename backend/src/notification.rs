@@ -1,14 +1,10 @@
-//! Notification forwarding module.
-//!
-//! Keeps the historical `WebhookSender` type name while supporting multiple
-//! notification channels configured from the notification center.
-
 use crate::config::{
     BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, FeishuRobotConfig,
     MessageChannelConfig, NotificationChannel, NotificationConfig, TelegramConfig, WebhookConfig,
     WecomAppConfig, WecomRobotConfig,
 };
 use crate::db::{CallRecord, SmsMessage};
+use crate::models::DdnsEvent;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -19,13 +15,13 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Webhook sender.
-pub struct WebhookSender {
+/// Notification sender for all configured notification channels.
+pub struct NotificationSender {
     client: Client,
     config_manager: Arc<ConfigManager>,
 }
 
-impl WebhookSender {
+impl NotificationSender {
     /// Create a new sender.
     pub fn new(config_manager: Arc<ConfigManager>) -> Self {
         Self {
@@ -73,6 +69,24 @@ impl WebhookSender {
                 .send_call_to_channel(channel, &config, call, false)
                 .await
             {
+                errors.push(format!("{}: {}", channel.label(), err));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// Forward a DDNS update/failure event to all enabled channels.
+    pub async fn forward_ddns_event(&self, event: &DdnsEvent) -> Result<(), String> {
+        let config = self.get_config();
+        let mut errors = Vec::new();
+
+        for channel in all_channels() {
+            if let Err(err) = self.send_ddns_to_channel(channel, &config, event).await {
                 errors.push(format!("{}: {}", channel.label(), err));
             }
         }
@@ -178,6 +192,37 @@ impl WebhookSender {
         }
     }
 
+    async fn send_ddns_to_channel(
+        &self,
+        channel: NotificationChannel,
+        config: &NotificationConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        match channel {
+            NotificationChannel::Webhook => self.send_webhook_ddns(&config.webhook, event).await,
+            NotificationChannel::Bark => self.send_bark_ddns(&config.bark, event).await,
+            NotificationChannel::WecomApp => {
+                self.send_wecom_app_ddns(&config.wecom_app, event).await
+            }
+            NotificationChannel::WecomRobot => {
+                self.send_wecom_robot_ddns(&config.wecom_robot, event).await
+            }
+            NotificationChannel::DingtalkRobot => {
+                self.send_dingtalk_robot_ddns(&config.dingtalk_robot, event)
+                    .await
+            }
+            NotificationChannel::DingtalkApp => {
+                self.send_dingtalk_app_ddns(&config.dingtalk_app, event)
+                    .await
+            }
+            NotificationChannel::FeishuRobot => {
+                self.send_feishu_robot_ddns(&config.feishu_robot, event)
+                    .await
+            }
+            NotificationChannel::Telegram => self.send_telegram_ddns(&config.telegram, event).await,
+        }
+    }
+
     async fn send_webhook_sms(
         &self,
         config: &WebhookConfig,
@@ -209,6 +254,22 @@ impl WebhookSender {
         }
 
         let payload = render_call_template(&config.call_template, call, true);
+        self.send_webhook_raw(config, &payload).await
+    }
+
+    async fn send_webhook_ddns(
+        &self,
+        config: &WebhookConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !config.enabled || !config.forward_ddns {
+            return Ok("Webhook skipped".to_string());
+        }
+        if config.url.trim().is_empty() {
+            return Err("Webhook URL is not configured".to_string());
+        }
+
+        let payload = render_ddns_template(&config.ddns_template, event, true);
         self.send_webhook_raw(config, &payload).await
     }
 
@@ -284,6 +345,25 @@ impl WebhookSender {
         self.send_bark_message(config, title, body).await
     }
 
+    async fn send_bark_ddns(
+        &self,
+        config: &BarkConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !should_send_ddns(&config.common) {
+            return Ok("Bark skipped".to_string());
+        }
+        if config.device_key.trim().is_empty() {
+            return Err("Bark device key is not configured".to_string());
+        }
+        self.send_bark_message(
+            config,
+            "SimAdmin DDNS 通知".to_string(),
+            render_ddns_template(&config.common.ddns_template, event, false),
+        )
+        .await
+    }
+
     async fn send_bark_message(
         &self,
         config: &BarkConfig,
@@ -346,6 +426,19 @@ impl WebhookSender {
         }
         let text = render_call_template(&config.common.call_template, call, false);
         self.send_wecom_app_text(config, text).await
+    }
+
+    async fn send_wecom_app_ddns(
+        &self,
+        config: &WecomAppConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !should_send_ddns(&config.common) {
+            return Ok("企业微信应用消息 skipped".to_string());
+        }
+        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_wecom_app_text(config, text)
+            .await
     }
 
     async fn send_wecom_app_text(
@@ -455,6 +548,19 @@ impl WebhookSender {
         self.send_wecom_robot_text(config, text).await
     }
 
+    async fn send_wecom_robot_ddns(
+        &self,
+        config: &WecomRobotConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !should_send_ddns(&config.common) {
+            return Ok("企业微信群机器人 skipped".to_string());
+        }
+        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_wecom_robot_text(config, text)
+            .await
+    }
+
     async fn send_wecom_robot_text(
         &self,
         config: &WecomRobotConfig,
@@ -497,6 +603,19 @@ impl WebhookSender {
         }
         let text = render_call_template(&config.common.call_template, call, false);
         self.send_dingtalk_robot_text(config, text).await
+    }
+
+    async fn send_dingtalk_robot_ddns(
+        &self,
+        config: &DingtalkRobotConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !should_send_ddns(&config.common) {
+            return Ok("钉钉群自定义机器人 skipped".to_string());
+        }
+        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_dingtalk_robot_text(config, text)
+            .await
     }
 
     async fn send_dingtalk_robot_text(
@@ -559,6 +678,19 @@ impl WebhookSender {
         }
         let text = render_call_template(&config.common.call_template, call, false);
         self.send_dingtalk_app_text(config, text).await
+    }
+
+    async fn send_dingtalk_app_ddns(
+        &self,
+        config: &DingtalkAppConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !should_send_ddns(&config.common) {
+            return Ok("钉钉企业内部机器人 skipped".to_string());
+        }
+        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_dingtalk_app_text(config, text)
+            .await
     }
 
     async fn send_dingtalk_app_text(
@@ -679,6 +811,19 @@ impl WebhookSender {
         self.send_feishu_robot_text(config, text).await
     }
 
+    async fn send_feishu_robot_ddns(
+        &self,
+        config: &FeishuRobotConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !should_send_ddns(&config.common) {
+            return Ok("飞书机器人 skipped".to_string());
+        }
+        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_feishu_robot_text(config, text)
+            .await
+    }
+
     async fn send_feishu_robot_text(
         &self,
         config: &FeishuRobotConfig,
@@ -728,6 +873,19 @@ impl WebhookSender {
         }
         let text = render_call_template(&config.common.call_template, call, false);
         self.send_telegram_text(config, text).await
+    }
+
+    async fn send_telegram_ddns(
+        &self,
+        config: &TelegramConfig,
+        event: &DdnsEvent,
+    ) -> Result<String, String> {
+        if !should_send_ddns(&config.common) {
+            return Ok("Telegram skipped".to_string());
+        }
+        let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_telegram_text(config, text)
+            .await
     }
 
     async fn send_telegram_text(
@@ -805,6 +963,79 @@ fn should_send_sms(config: &MessageChannelConfig, force: bool) -> bool {
 
 fn should_send_call(config: &MessageChannelConfig, force: bool) -> bool {
     force || (config.enabled && config.forward_calls)
+}
+
+fn should_send_ddns(config: &MessageChannelConfig) -> bool {
+    config.enabled && config.forward_ddns
+}
+
+const DEFAULT_DDNS_TEXT_TEMPLATE: &str = "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}";
+const DEFAULT_DDNS_JSON_TEMPLATE: &str = r#"{
+  "msg_type": "text",
+  "content": {
+    "text": "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}"
+  }
+}"#;
+
+fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) -> String {
+    let domains = if event.domains.is_empty() {
+        "-".to_string()
+    } else {
+        event.domains.join(", ")
+    };
+    let ip_type = match event.record_type.as_str() {
+        "A" => "IPv4",
+        "AAAA" => "IPv6",
+        other => other,
+    };
+    let old_ip = event.old_ip.as_deref().unwrap_or("-").to_string();
+    let new_ip = event.new_ip.as_deref().unwrap_or("-").to_string();
+    let template = if template.trim().is_empty() && escape_json {
+        DEFAULT_DDNS_JSON_TEMPLATE
+    } else if template.trim().is_empty() {
+        DEFAULT_DDNS_TEXT_TEMPLATE
+    } else {
+        template
+    };
+
+    let maybe_escape = |value: &str| {
+        if escape_json {
+            escape_json_string(value)
+        } else {
+            value.to_string()
+        }
+    };
+    let domains = maybe_escape(&domains);
+    let ip_type = maybe_escape(ip_type);
+    let old_ip = maybe_escape(&old_ip);
+    let new_ip = maybe_escape(&new_ip);
+    let provider = maybe_escape(&event.provider);
+    let record_type = maybe_escape(&event.record_type);
+    let status = maybe_escape(&event.status);
+    let message = maybe_escape(&event.message);
+    let timestamp = maybe_escape(&event.timestamp);
+
+    template
+        .replace("{{domains}}", &domains)
+        .replace("{{domain}}", &domains)
+        .replace("{{ip_type}}", &ip_type)
+        .replace("{{new_ip}}", &new_ip)
+        .replace("{{old_ip}}", &old_ip)
+        .replace("{{provider}}", &provider)
+        .replace("{{record_type}}", &record_type)
+        .replace("{{status}}", &status)
+        .replace("{{message}}", &message)
+        .replace("{{timestamp}}", &timestamp)
+        .replace("{{time}}", &timestamp)
+        .replace("{{域名}}", &domains)
+        .replace("{{IP类型}}", &ip_type)
+        .replace("{{新IP}}", &new_ip)
+        .replace("{{旧IP}}", &old_ip)
+        .replace("{{服务商}}", &provider)
+        .replace("{{记录类型}}", &record_type)
+        .replace("{{状态}}", &status)
+        .replace("{{消息}}", &message)
+        .replace("{{更新时间}}", &timestamp)
 }
 
 fn robot_webhook_url(webhook_url: &str, key: &str, prefix: &str) -> Result<String, String> {

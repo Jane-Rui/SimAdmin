@@ -86,21 +86,11 @@ const EMPTY_BAND_LOCK_CONFIG: SavedBandLockConfig = {
   nr_fdd_bands: [],
   nr_tdd_bands: [],
 }
+const BAND_LOCK_CONFIG_STORAGE_KEY = 'simadmin:band-lock-config'
 
 function normalizeBandList(value: unknown): number[] {
   if (!Array.isArray(value)) return []
   return value.filter((band): band is number => Number.isInteger(band))
-}
-
-function bandLockStatusToConfig(status: BandLockStatus): SavedBandLockConfig {
-  if (!status.locked) return EMPTY_BAND_LOCK_CONFIG
-  return {
-    mode: 'custom',
-    lte_fdd_bands: normalizeBandList(status.lte_fdd_bands),
-    lte_tdd_bands: normalizeBandList(status.lte_tdd_bands),
-    nr_fdd_bands: normalizeBandList(status.nr_fdd_bands),
-    nr_tdd_bands: normalizeBandList(status.nr_tdd_bands),
-  }
 }
 
 function supportedBandLockConfig(status: BandLockStatus | null): SavedBandLockConfig {
@@ -111,6 +101,49 @@ function supportedBandLockConfig(status: BandLockStatus | null): SavedBandLockCo
     lte_tdd_bands: normalizeBandList(status.supported_lte_tdd_bands ?? status.lte_tdd_bands),
     nr_fdd_bands: normalizeBandList(status.supported_nr_fdd_bands ?? status.nr_fdd_bands),
     nr_tdd_bands: normalizeBandList(status.supported_nr_tdd_bands ?? status.nr_tdd_bands),
+  }
+}
+
+function filterSupportedBands(selected: unknown, supported: number[]): number[] {
+  const normalized = normalizeBandList(selected)
+  if (supported.length === 0) return normalized
+  const allowed = new Set(supported)
+  return normalized.filter((band) => allowed.has(band))
+}
+
+function sanitizeBandLockConfig(
+  config: Partial<SavedBandLockConfig> | null,
+  status: BandLockStatus | null,
+): SavedBandLockConfig | null {
+  if (!config) return null
+  if (config.mode !== 'custom') return EMPTY_BAND_LOCK_CONFIG
+  const supported = supportedBandLockConfig(status)
+  return {
+    mode: 'custom',
+    lte_fdd_bands: filterSupportedBands(config.lte_fdd_bands, supported.lte_fdd_bands),
+    lte_tdd_bands: filterSupportedBands(config.lte_tdd_bands, supported.lte_tdd_bands),
+    nr_fdd_bands: filterSupportedBands(config.nr_fdd_bands, supported.nr_fdd_bands),
+    nr_tdd_bands: filterSupportedBands(config.nr_tdd_bands, supported.nr_tdd_bands),
+  }
+}
+
+function loadSavedBandLockConfig(status: BandLockStatus | null): SavedBandLockConfig | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = window.localStorage.getItem(BAND_LOCK_CONFIG_STORAGE_KEY)
+    if (!raw) return null
+    return sanitizeBandLockConfig(JSON.parse(raw) as Partial<SavedBandLockConfig>, status)
+  } catch {
+    return null
+  }
+}
+
+function saveBandLockConfig(config: SavedBandLockConfig) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(BAND_LOCK_CONFIG_STORAGE_KEY, JSON.stringify(config))
+  } catch {
+    // localStorage may be unavailable in restricted browser modes.
   }
 }
 
@@ -223,7 +256,8 @@ export default function NetworkPage() {
 
   const handleBandLockModeChange = (mode: BandLockMode) => {
     if (mode === 'custom' && lockMode === 'unlocked') {
-      applyBandLockConfigToState(supportedBandOptions)
+      const saved = loadSavedBandLockConfig(bandLockStatus)
+      applyBandLockConfigToState(saved?.mode === 'custom' ? saved : supportedBandOptions)
       return
     }
     setLockMode(mode)
@@ -247,7 +281,7 @@ export default function NetworkPage() {
       
       if (bandLockRes.data) {
         setBandLockStatus(bandLockRes.data)
-        applyBandLockConfigToState(bandLockStatusToConfig(bandLockRes.data))
+        applyBandLockConfigToState(loadSavedBandLockConfig(bandLockRes.data) ?? EMPTY_BAND_LOCK_CONFIG)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -538,6 +572,10 @@ export default function NetworkPage() {
     try {
       const response = await api.setBandLock(request)
       void response
+      saveBandLockConfig({
+        mode: lockMode,
+        ...request,
+      })
       setSuccess(lockMode === 'unlocked' ? '已取消频段限制，所有频段可用' : '频段锁定配置已应用')
       // 1秒后刷新频段锁定状态
       setTimeout(() => void loadBandLockConfig(), 1000)
@@ -561,6 +599,7 @@ export default function NetworkPage() {
     try {
       const response = await api.setBandLock(request)
       void response
+      saveBandLockConfig(EMPTY_BAND_LOCK_CONFIG)
       setLockMode('unlocked')
       setSuccess('已取消频段限制，所有频段可用')
       // 清空本地复选框状态
@@ -798,10 +837,10 @@ export default function NetworkPage() {
       {/* 页面标题 */}
       <Box mb={3}>
         <Typography variant="h4" gutterBottom fontWeight={600}>
-          网络状态
+          蜂窝网络
         </Typography>
         <Typography variant="body2" color="text.secondary">
-          查看网络信息、运营商、小区数据和 QoS 参数
+          查看蜂窝网络、运营商、小区数据和 QoS 参数
         </Typography>
       </Box>
 
