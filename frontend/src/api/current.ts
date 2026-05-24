@@ -36,8 +36,8 @@ import type {
   ManualRegisterRequest,
   NetworkInfo,
   NetworkInterfacesResponse,
-  NotificationChannelKey,
   NotificationConfig,
+  NotificationLogsResponse,
   OperatorListResponse,
   OtaStatusResponse,
   OtaLatestReleaseResponse,
@@ -699,9 +699,29 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async testNotificationChannel(channel: NotificationChannelKey) {
+  async testNotificationChannel(channel: string) {
     return request<ApiResponse<WebhookTestResponse>>(`/notifications/test/${channel}`, {
       method: 'POST',
+    })
+  }
+
+  async getNotificationLogs(params?: { type?: string; status?: string; q?: string; start_date?: string; end_date?: string; limit?: number; offset?: number }) {
+    const query = new URLSearchParams()
+    if (params?.type) query.append('type', params.type)
+    if (params?.status) query.append('status', params.status)
+    if (params?.q) query.append('q', params.q)
+    if (params?.start_date) query.append('start_date', params.start_date)
+    if (params?.end_date) query.append('end_date', params.end_date)
+    if (params?.limit) query.append('limit', params.limit.toString())
+    if (params?.offset) query.append('offset', params.offset.toString())
+    const queryStr = query.toString() ? `?${query.toString()}` : ''
+    return request<ApiResponse<NotificationLogsResponse>>(`/notifications/logs${queryStr}`)
+  }
+
+  async clearNotificationLogs(filters?: { type?: string; status?: string; start_date?: string; end_date?: string }) {
+    return request<ApiResponse<{ deleted: number }>>('/notifications/logs/clear', {
+      method: 'POST',
+      body: JSON.stringify(filters ?? {}),
     })
   }
 

@@ -2,7 +2,8 @@
 //!
 //! 使用 JSON 文件存储用户配置，支持热更新
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -199,7 +200,7 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationConfig {
+pub struct LegacyNotificationConfig {
     #[serde(default)]
     pub webhook: WebhookConfig,
     #[serde(default)]
@@ -220,7 +221,7 @@ pub struct NotificationConfig {
     pub telegram: TelegramConfig,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationChannel {
     Webhook,
@@ -233,6 +234,187 @@ pub enum NotificationChannel {
     DingtalkApp,
     FeishuRobot,
     Telegram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationEventType {
+    Sms,
+    Ddns,
+    VersionUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatcherOperator {
+    Always,
+    Contains,
+    NotContains,
+    Equals,
+    Regex,
+}
+
+fn default_matcher_operator() -> MatcherOperator {
+    MatcherOperator::Always
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleMatcher {
+    #[serde(default)]
+    pub field: String,
+    #[serde(default = "default_matcher_operator")]
+    pub operator: MatcherOperator,
+    #[serde(default)]
+    pub value: String,
+}
+
+impl Default for RuleMatcher {
+    fn default() -> Self {
+        Self {
+            field: "summary".to_string(),
+            operator: MatcherOperator::Always,
+            value: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuietHoursSchedule {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub weekdays: Vec<u8>,
+    #[serde(default = "default_quiet_start")]
+    pub start: String,
+    #[serde(default = "default_quiet_end")]
+    pub end: String,
+}
+
+fn default_quiet_start() -> String {
+    "22:00".to_string()
+}
+
+fn default_quiet_end() -> String {
+    "08:00".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRule {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub event_type: NotificationEventType,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub matcher: RuleMatcher,
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    #[serde(default)]
+    pub template: String,
+    #[serde(default)]
+    pub quiet_hours: Vec<QuietHoursSchedule>,
+    #[serde(default = "default_ddns_failure_threshold")]
+    pub ddns_failure_threshold: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationChannelInstance {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub channel_type: NotificationChannel,
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub config: Value,
+}
+
+fn default_ddns_failure_threshold() -> u32 {
+    1
+}
+
+fn default_notification_log_retention_days() -> u32 {
+    90
+}
+
+fn default_notification_log_max_entries() -> u32 {
+    10_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationLogCleanupConfig {
+    #[serde(default)]
+    pub retention_days_enabled: bool,
+    #[serde(default = "default_notification_log_retention_days")]
+    pub retention_days: u32,
+    #[serde(default)]
+    pub max_entries_enabled: bool,
+    #[serde(default = "default_notification_log_max_entries")]
+    pub max_entries: u32,
+}
+
+impl Default for NotificationLogCleanupConfig {
+    fn default() -> Self {
+        Self {
+            retention_days_enabled: false,
+            retention_days: default_notification_log_retention_days(),
+            max_entries_enabled: false,
+            max_entries: default_notification_log_max_entries(),
+        }
+    }
+}
+
+fn default_notification_version() -> u8 {
+    2
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationConfig {
+    #[serde(default = "default_notification_version")]
+    pub version: u8,
+    #[serde(default)]
+    pub channels: Vec<NotificationChannelInstance>,
+    #[serde(default)]
+    pub rules: Vec<NotificationRule>,
+    #[serde(default)]
+    pub log_cleanup: NotificationLogCleanupConfig,
+}
+
+#[derive(Deserialize)]
+struct NotificationConfigV2 {
+    #[serde(default = "default_notification_version", rename = "version")]
+    _version: u8,
+    #[serde(default)]
+    channels: Vec<NotificationChannelInstance>,
+    #[serde(default)]
+    rules: Vec<NotificationRule>,
+    #[serde(default)]
+    log_cleanup: NotificationLogCleanupConfig,
+}
+
+impl<'de> Deserialize<'de> for NotificationConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let is_v2 = value.get("channels").is_some() || value.get("rules").is_some();
+        if is_v2 {
+            let parsed: NotificationConfigV2 =
+                serde_json::from_value(value).map_err(D::Error::custom)?;
+            return Ok(Self {
+                version: 2,
+                channels: parsed.channels,
+                rules: parsed.rules,
+                log_cleanup: parsed.log_cleanup,
+            });
+        }
+
+        let legacy: LegacyNotificationConfig =
+            serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self::from_legacy(legacy))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,7 +499,7 @@ fn default_sms_template() -> String {
     r#"{
   "msg_type": "text",
   "content": {
-    "text": "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}\n本机号码: {{own_number}}"
+    "text": "📱 短信通知\n号码: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}\n来源: {{own_number}}"
   }
 }"#
     .to_string()
@@ -354,7 +536,8 @@ fn default_update_template() -> String {
 }
 
 fn default_plain_sms_template() -> String {
-    "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}\n本机号码: {{own_number}}".to_string()
+    "📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n来源: {{本机号码}}"
+        .to_string()
 }
 
 fn default_plain_call_template() -> String {
@@ -362,11 +545,11 @@ fn default_plain_call_template() -> String {
 }
 
 fn default_plain_ddns_template() -> String {
-    "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}".to_string()
+    "SimAdmin DDNS 通知\n域名: {{域名}}\nIP类型: {{IP类型}}\n新IP: {{新IP}}\n旧IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}".to_string()
 }
 
 fn default_plain_update_template() -> String {
-    "SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n构建时间: {{build_time}}\nOTA包 MD5: {{md5}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。".to_string()
+    "SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。".to_string()
 }
 
 fn default_sms_title_template() -> String {
@@ -532,7 +715,7 @@ impl Default for TelegramConfig {
     }
 }
 
-impl Default for NotificationConfig {
+impl Default for LegacyNotificationConfig {
     fn default() -> Self {
         Self {
             webhook: WebhookConfig::default(),
@@ -544,6 +727,326 @@ impl Default for NotificationConfig {
             dingtalk_app: DingtalkAppConfig::default(),
             feishu_robot: FeishuRobotConfig::default(),
             telegram: TelegramConfig::default(),
+        }
+    }
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            channels: Vec::new(),
+            rules: Vec::new(),
+            log_cleanup: NotificationLogCleanupConfig::default(),
+        }
+    }
+}
+
+struct LegacyChannelMigration {
+    id: String,
+    channel_type: NotificationChannel,
+    name: String,
+    enabled: bool,
+    config: Value,
+    forward_sms: bool,
+    forward_ddns: bool,
+    forward_updates: bool,
+    sms_template: String,
+    ddns_template: String,
+    update_template: String,
+}
+
+impl NotificationConfig {
+    pub fn from_legacy(legacy: LegacyNotificationConfig) -> Self {
+        let migrations = legacy_channel_migrations(&legacy);
+        let channels = migrations
+            .iter()
+            .map(|item| NotificationChannelInstance {
+                id: item.id.clone(),
+                channel_type: item.channel_type,
+                name: item.name.clone(),
+                enabled: item.enabled,
+                config: item.config.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut rules = Vec::new();
+        push_legacy_rule(
+            &mut rules,
+            NotificationEventType::Sms,
+            "默认短信转发",
+            "legacy-sms",
+            &migrations,
+        );
+        push_legacy_rule(
+            &mut rules,
+            NotificationEventType::Ddns,
+            "默认 DDNS 转发",
+            "legacy-ddns",
+            &migrations,
+        );
+        push_legacy_rule(
+            &mut rules,
+            NotificationEventType::VersionUpdate,
+            "默认版本更新转发",
+            "legacy-version-update",
+            &migrations,
+        );
+
+        Self {
+            version: 2,
+            channels,
+            rules,
+            log_cleanup: NotificationLogCleanupConfig::default(),
+        }
+    }
+
+    pub fn first_webhook_config(&self) -> Option<WebhookConfig> {
+        self.channels
+            .iter()
+            .find(|channel| channel.channel_type == NotificationChannel::Webhook)
+            .and_then(|channel| serde_json::from_value(channel.config.clone()).ok())
+    }
+}
+
+fn channel_label(channel: NotificationChannel) -> &'static str {
+    match channel {
+        NotificationChannel::Webhook => "Webhook",
+        NotificationChannel::Bark => "Bark",
+        NotificationChannel::PushPlus => "PushPlus",
+        NotificationChannel::WecomApp => "企业微信应用消息",
+        NotificationChannel::WecomRobot => "企业微信群机器人",
+        NotificationChannel::DingtalkRobot => "钉钉群自定义机器人",
+        NotificationChannel::DingtalkApp => "钉钉企业内机器人",
+        NotificationChannel::FeishuRobot => "飞书机器人",
+        NotificationChannel::Telegram => "Telegram 机器人",
+    }
+}
+
+fn config_value<T: Serialize>(config: &T) -> Value {
+    serde_json::to_value(config).unwrap_or(Value::Object(Default::default()))
+}
+
+fn legacy_channel_migrations(legacy: &LegacyNotificationConfig) -> Vec<LegacyChannelMigration> {
+    let mut channels = Vec::new();
+
+    if legacy.webhook.enabled || !legacy.webhook.url.trim().is_empty() {
+        channels.push(LegacyChannelMigration {
+            id: "webhook-1".to_string(),
+            channel_type: NotificationChannel::Webhook,
+            name: channel_label(NotificationChannel::Webhook).to_string(),
+            enabled: legacy.webhook.enabled,
+            config: config_value(&legacy.webhook),
+            forward_sms: legacy.webhook.forward_sms,
+            forward_ddns: legacy.webhook.forward_ddns,
+            forward_updates: legacy.webhook.forward_updates,
+            sms_template: webhook_text_template(
+                &legacy.webhook.sms_template,
+                &default_rule_template(NotificationEventType::Sms),
+            ),
+            ddns_template: webhook_text_template(
+                &legacy.webhook.ddns_template,
+                &default_rule_template(NotificationEventType::Ddns),
+            ),
+            update_template: webhook_text_template(
+                &legacy.webhook.update_template,
+                &default_rule_template(NotificationEventType::VersionUpdate),
+            ),
+        });
+    }
+
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::Bark,
+        "bark-1",
+        &legacy.bark.common,
+        &legacy.bark,
+        legacy.bark.common.enabled || !legacy.bark.device_key.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::PushPlus,
+        "pushplus-1",
+        &legacy.pushplus.common,
+        &legacy.pushplus,
+        legacy.pushplus.common.enabled || !legacy.pushplus.token.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::WecomApp,
+        "wecom-app-1",
+        &legacy.wecom_app.common,
+        &legacy.wecom_app,
+        legacy.wecom_app.common.enabled
+            || !legacy.wecom_app.corp_id.trim().is_empty()
+            || !legacy.wecom_app.agent_id.trim().is_empty()
+            || !legacy.wecom_app.secret.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::WecomRobot,
+        "wecom-robot-1",
+        &legacy.wecom_robot.common,
+        &legacy.wecom_robot,
+        legacy.wecom_robot.common.enabled
+            || !legacy.wecom_robot.webhook_url.trim().is_empty()
+            || !legacy.wecom_robot.key.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::DingtalkRobot,
+        "dingtalk-robot-1",
+        &legacy.dingtalk_robot.common,
+        &legacy.dingtalk_robot,
+        legacy.dingtalk_robot.common.enabled
+            || !legacy.dingtalk_robot.webhook_url.trim().is_empty()
+            || !legacy.dingtalk_robot.access_token.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::DingtalkApp,
+        "dingtalk-app-1",
+        &legacy.dingtalk_app.common,
+        &legacy.dingtalk_app,
+        legacy.dingtalk_app.common.enabled
+            || !legacy.dingtalk_app.app_key.trim().is_empty()
+            || !legacy.dingtalk_app.app_secret.trim().is_empty()
+            || !legacy.dingtalk_app.open_conversation_id.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::FeishuRobot,
+        "feishu-robot-1",
+        &legacy.feishu_robot.common,
+        &legacy.feishu_robot,
+        legacy.feishu_robot.common.enabled
+            || !legacy.feishu_robot.webhook_url.trim().is_empty()
+            || !legacy.feishu_robot.token.trim().is_empty(),
+    );
+    push_message_channel_migration(
+        &mut channels,
+        NotificationChannel::Telegram,
+        "telegram-1",
+        &legacy.telegram.common,
+        &legacy.telegram,
+        legacy.telegram.common.enabled
+            || !legacy.telegram.bot_token.trim().is_empty()
+            || !legacy.telegram.chat_id.trim().is_empty(),
+    );
+
+    channels
+}
+
+fn push_message_channel_migration<T: Serialize>(
+    channels: &mut Vec<LegacyChannelMigration>,
+    channel_type: NotificationChannel,
+    id: &str,
+    common: &MessageChannelConfig,
+    config: &T,
+    configured: bool,
+) {
+    if !configured {
+        return;
+    }
+    channels.push(LegacyChannelMigration {
+        id: id.to_string(),
+        channel_type,
+        name: channel_label(channel_type).to_string(),
+        enabled: common.enabled,
+        config: config_value(config),
+        forward_sms: common.forward_sms,
+        forward_ddns: common.forward_ddns,
+        forward_updates: common.forward_updates,
+        sms_template: non_empty_template(&common.sms_template, NotificationEventType::Sms),
+        ddns_template: non_empty_template(&common.ddns_template, NotificationEventType::Ddns),
+        update_template: non_empty_template(
+            &common.update_template,
+            NotificationEventType::VersionUpdate,
+        ),
+    });
+}
+
+fn push_legacy_rule(
+    rules: &mut Vec<NotificationRule>,
+    event_type: NotificationEventType,
+    name: &str,
+    id: &str,
+    channels: &[LegacyChannelMigration],
+) {
+    let selected = channels
+        .iter()
+        .filter(|channel| match event_type {
+            NotificationEventType::Sms => channel.forward_sms,
+            NotificationEventType::Ddns => channel.forward_ddns,
+            NotificationEventType::VersionUpdate => channel.forward_updates,
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return;
+    }
+
+    let template = selected
+        .first()
+        .map(|channel| match event_type {
+            NotificationEventType::Sms => channel.sms_template.clone(),
+            NotificationEventType::Ddns => channel.ddns_template.clone(),
+            NotificationEventType::VersionUpdate => channel.update_template.clone(),
+        })
+        .unwrap_or_else(|| default_rule_template(event_type));
+
+    rules.push(NotificationRule {
+        id: id.to_string(),
+        event_type,
+        name: name.to_string(),
+        enabled: true,
+        matcher: RuleMatcher::default(),
+        channel_ids: selected
+            .into_iter()
+            .map(|channel| channel.id.clone())
+            .collect(),
+        template,
+        quiet_hours: Vec::new(),
+        ddns_failure_threshold: default_ddns_failure_threshold(),
+    });
+}
+
+fn non_empty_template(template: &str, event_type: NotificationEventType) -> String {
+    if template.trim().is_empty() {
+        default_rule_template(event_type)
+    } else {
+        template.to_string()
+    }
+}
+
+fn webhook_text_template(template: &str, fallback: &str) -> String {
+    if template.trim().is_empty() {
+        return fallback.to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(template) {
+        if let Some(text) = value
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(Value::as_str)
+        {
+            return text.replace("\\n", "\n");
+        }
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            return text.replace("\\n", "\n");
+        }
+    }
+    template.to_string()
+}
+
+pub fn default_rule_template(event_type: NotificationEventType) -> String {
+    match event_type {
+        NotificationEventType::Sms => {
+            "📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n来源: {{本机号码}}".to_string()
+        }
+        NotificationEventType::Ddns => {
+            "DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}".to_string()
+        }
+        NotificationEventType::VersionUpdate => {
+            "发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}".to_string()
         }
     }
 }
@@ -631,6 +1134,40 @@ mod tests {
             serde_json::to_string(&NotificationChannel::PushPlus).unwrap(),
             r#""pushplus""#
         );
+    }
+
+    #[test]
+    fn legacy_notification_config_migrates_channels_and_rules() {
+        let mut legacy = LegacyNotificationConfig::default();
+        legacy.webhook.enabled = true;
+        legacy.webhook.url = "https://example.com/hook".to_string();
+        legacy.webhook.forward_sms = true;
+        legacy.webhook.forward_ddns = false;
+        legacy.webhook.forward_updates = true;
+
+        let migrated = NotificationConfig::from_legacy(legacy);
+
+        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.channels.len(), 1);
+        assert_eq!(migrated.channels[0].id, "webhook-1");
+        assert_eq!(
+            migrated.channels[0].channel_type,
+            NotificationChannel::Webhook
+        );
+        assert!(migrated.channels[0].enabled);
+        assert!(migrated
+            .rules
+            .iter()
+            .any(|rule| rule.event_type == NotificationEventType::Sms
+                && rule.channel_ids == vec!["webhook-1".to_string()]));
+        assert!(!migrated
+            .rules
+            .iter()
+            .any(|rule| rule.event_type == NotificationEventType::Ddns));
+        assert!(migrated
+            .rules
+            .iter()
+            .any(|rule| rule.event_type == NotificationEventType::VersionUpdate));
     }
 }
 
@@ -796,12 +1333,18 @@ impl Default for AppConfig {
 }
 
 fn migrate_legacy_webhook_config(config: &mut AppConfig) {
-    if config.notifications.webhook == WebhookConfig::default()
+    if config.notifications.channels.is_empty()
+        && config.notifications.rules.is_empty()
         && config.webhook != WebhookConfig::default()
     {
-        config.notifications.webhook = config.webhook.clone();
+        let mut legacy = LegacyNotificationConfig::default();
+        legacy.webhook = config.webhook.clone();
+        config.notifications = NotificationConfig::from_legacy(legacy);
     }
-    config.webhook = config.notifications.webhook.clone();
+    config.webhook = config
+        .notifications
+        .first_webhook_config()
+        .unwrap_or_else(WebhookConfig::default);
 }
 
 /// 配置管理器
@@ -952,7 +1495,9 @@ impl ConfigManager {
     pub fn set_notifications(&self, notifications: NotificationConfig) -> Result<(), String> {
         {
             let mut config = self.config.write().unwrap();
-            config.webhook = notifications.webhook.clone();
+            config.webhook = notifications
+                .first_webhook_config()
+                .unwrap_or_else(WebhookConfig::default);
             config.notifications = notifications;
         }
         self.save()

@@ -23,6 +23,7 @@ md5 = "0.7"
 base64 = "0.22.1"
 percent-encoding = "2.3.2"
 ring = "0.17.14"
+regex-automata = "0.4.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

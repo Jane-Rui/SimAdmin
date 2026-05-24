@@ -773,6 +773,14 @@ async fn main() -> Result<()> {
         )
         // ========== OTA 更新接口 ==========
         .route(
+            "/api/notifications/logs",
+            get(get_notification_logs_handler).options(options_handler),
+        )
+        .route(
+            "/api/notifications/logs/clear",
+            post(clear_notification_logs_handler).options(options_handler),
+        )
+        .route(
             "/api/ota/status",
             get(get_ota_status_handler).options(options_handler),
         )

@@ -1535,6 +1535,7 @@ dependencies = [
  "libc",
  "md5",
  "percent-encoding",
+ "regex-automata",
  "reqwest",
  "ring",
  "rusqlite",

@@ -36,6 +36,7 @@ struct DdnsRuntimeState {
     last_ipv6: Option<String>,
     last_message: Option<String>,
     logs: VecDeque<DdnsLogEntry>,
+    failure_counts: BTreeMap<String, u32>,
 }
 
 #[derive(Clone)]
@@ -191,7 +192,11 @@ impl DdnsManager {
                 };
                 self.push_log("error", record_type, domains.clone(), &result.message)
                     .await;
-                self.notify(config, &result, notification_sender).await;
+                let failure_count = self
+                    .update_failure_count(config, record_type, &domains, true)
+                    .await;
+                self.notify(config, &result, failure_count, notification_sender)
+                    .await;
                 return result;
             }
         };
@@ -232,16 +237,45 @@ impl DdnsManager {
         };
         self.push_log(log_level, record_type, domains, &result.message)
             .await;
+        let failure_count = self
+            .update_failure_count(
+                config,
+                record_type,
+                &result.domains,
+                result.status == "failed",
+            )
+            .await;
         if matches!(result.status.as_str(), "updated" | "failed") {
-            self.notify(config, &result, notification_sender).await;
+            self.notify(config, &result, failure_count, notification_sender)
+                .await;
         }
         result
+    }
+
+    async fn update_failure_count(
+        &self,
+        config: &DdnsConfig,
+        record_type: &str,
+        domains: &[String],
+        failed: bool,
+    ) -> u32 {
+        let key = ddns_failure_key(&config.provider, record_type, domains);
+        let mut state = self.state.lock().await;
+        if failed {
+            let count = state.failure_counts.entry(key).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        } else {
+            state.failure_counts.remove(&key);
+            0
+        }
     }
 
     async fn notify(
         &self,
         config: &DdnsConfig,
         result: &DdnsRecordSyncResult,
+        failure_count: u32,
         notification_sender: Arc<NotificationSender>,
     ) {
         let event = DdnsEvent {
@@ -253,6 +287,7 @@ impl DdnsManager {
             status: result.status.clone(),
             message: result.message.clone(),
             timestamp: now_string(),
+            failure_count,
         };
         if let Err(err) = notification_sender.forward_ddns_event(&event).await {
             self.push_log(
@@ -354,6 +389,10 @@ fn normalize_domains(domains: &[String]) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn ddns_failure_key(provider: &str, record_type: &str, domains: &[String]) -> String {
+    format!("{}|{}|{}", provider, record_type, domains.join(","))
 }
 
 fn default_urls_for_record(record_type: &str) -> Vec<String> {

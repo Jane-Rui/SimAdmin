@@ -2,7 +2,7 @@
 //!
 //! 使用 SQLite 存储短信历史记录和通话记录
 
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -45,6 +45,37 @@ pub struct SmsStats {
     pub pushed: i64,
     #[serde(default)]
     pub push_attempted: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationLogEntry {
+    pub id: i64,
+    pub event_type: String,
+    pub status: String,
+    pub summary: String,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub message: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationLogsResponse {
+    pub logs: Vec<NotificationLogEntry>,
+    pub total: i64,
+}
+
+pub struct NewNotificationLog<'a> {
+    pub event_type: &'a str,
+    pub status: &'a str,
+    pub summary: &'a str,
+    pub rule_id: &'a str,
+    pub rule_name: &'a str,
+    pub channel_id: &'a str,
+    pub channel_name: &'a str,
+    pub message: &'a str,
 }
 
 /// 通话统计
@@ -163,6 +194,25 @@ fn sms_timestamp_for_display(timestamp: String) -> String {
     normalize_sms_timestamp_for_display(&timestamp).unwrap_or(timestamp)
 }
 
+fn notification_log_date_bound(value: &str, suffix: &str) -> String {
+    let value = value.trim().replace('/', "-");
+    if value.is_empty() {
+        String::new()
+    } else if value.len() <= 10 {
+        format!("{value} {suffix}")
+    } else {
+        value
+    }
+}
+
+fn notification_log_start_bound(value: &str) -> String {
+    notification_log_date_bound(value, "00:00:00")
+}
+
+fn notification_log_end_bound(value: &str) -> String {
+    notification_log_date_bound(value, "23:59:59")
+}
+
 fn sms_message_from_row(row: &Row<'_>) -> Result<SmsMessage> {
     let timestamp: String = row.get(4)?;
     Ok(SmsMessage {
@@ -268,6 +318,30 @@ impl Database {
             [],
         )?;
         normalize_existing_sms_timestamps(&conn)?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS notification_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                rule_name TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                channel_name TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_logs_created_at ON notification_logs(created_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_logs_type_status ON notification_logs(event_type, status)",
+            [],
+        )?;
 
         // 创建通话记录表（如果不存在）
         conn.execute(
@@ -640,6 +714,166 @@ impl Database {
     }
 
     /// 获取短信统计
+    pub fn insert_notification_log(&self, log: NewNotificationLog<'_>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO notification_logs (
+                event_type, status, summary, rule_id, rule_name,
+                channel_id, channel_name, message, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                log.event_type,
+                log.status,
+                log.summary,
+                log.rule_id,
+                log.rule_name,
+                log.channel_id,
+                log.channel_name,
+                log.message,
+                beijing_sms_now_string(),
+            ],
+        )
+    }
+
+    pub fn get_notification_logs(
+        &self,
+        event_type: &str,
+        status: &str,
+        query: &str,
+        start_date: &str,
+        end_date: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<NotificationLogsResponse> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 200);
+        let offset = offset.max(0);
+        let event_type = event_type.trim();
+        let status = status.trim();
+        let query = query.trim();
+        let start_at = notification_log_start_bound(start_date);
+        let end_at = notification_log_end_bound(end_date);
+
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM notification_logs
+             WHERE (?1 = '' OR event_type = ?1)
+               AND (?2 = '' OR status = ?2)
+               AND (
+                    ?3 = ''
+                    OR summary LIKE '%' || ?3 || '%'
+                    OR rule_name LIKE '%' || ?3 || '%'
+                    OR channel_name LIKE '%' || ?3 || '%'
+                    OR message LIKE '%' || ?3 || '%'
+               )
+               AND (?4 = '' OR created_at >= ?4)
+               AND (?5 = '' OR created_at <= ?5)",
+            params![event_type, status, query, start_at, end_at],
+            |row| row.get(0),
+        )?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, event_type, status, summary, rule_id, rule_name,
+                    channel_id, channel_name, message, created_at
+             FROM notification_logs
+             WHERE (?1 = '' OR event_type = ?1)
+               AND (?2 = '' OR status = ?2)
+               AND (
+                    ?3 = ''
+                    OR summary LIKE '%' || ?3 || '%'
+                    OR rule_name LIKE '%' || ?3 || '%'
+                    OR channel_name LIKE '%' || ?3 || '%'
+                    OR message LIKE '%' || ?3 || '%'
+               )
+               AND (?4 = '' OR created_at >= ?4)
+               AND (?5 = '' OR created_at <= ?5)
+             ORDER BY id DESC
+             LIMIT ?6 OFFSET ?7",
+        )?;
+
+        let rows = stmt.query_map(
+            params![event_type, status, query, start_at, end_at, limit, offset],
+            |row| {
+                Ok(NotificationLogEntry {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    status: row.get(2)?,
+                    summary: row.get(3)?,
+                    rule_id: row.get(4)?,
+                    rule_name: row.get(5)?,
+                    channel_id: row.get(6)?,
+                    channel_name: row.get(7)?,
+                    message: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            },
+        )?;
+
+        let mut logs = Vec::new();
+        for row in rows {
+            logs.push(row?);
+        }
+
+        Ok(NotificationLogsResponse { logs, total })
+    }
+
+    pub fn clear_notification_logs(
+        &self,
+        event_type: &str,
+        status: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let event_type = event_type.trim();
+        let status = status.trim();
+        let start_at = notification_log_start_bound(start_date);
+        let end_at = notification_log_end_bound(end_date);
+        conn.execute(
+            "DELETE FROM notification_logs
+             WHERE (?1 = '' OR event_type = ?1)
+               AND (?2 = '' OR status = ?2)
+               AND (?3 = '' OR created_at >= ?3)
+               AND (?4 = '' OR created_at <= ?4)",
+            params![event_type, status, start_at, end_at],
+        )
+    }
+
+    pub fn cleanup_notification_logs(
+        &self,
+        retention_days: Option<u32>,
+        max_entries: Option<u32>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut deleted = 0usize;
+
+        if let Some(days) = retention_days.filter(|days| *days > 0) {
+            let cutoff = Utc::now()
+                .with_timezone(&beijing_offset())
+                .checked_sub_signed(Duration::days(i64::from(days)))
+                .unwrap_or_else(|| Utc::now().with_timezone(&beijing_offset()))
+                .format(SMS_TIMESTAMP_FORMAT)
+                .to_string();
+            deleted += conn.execute(
+                "DELETE FROM notification_logs WHERE created_at < ?1",
+                params![cutoff],
+            )?;
+        }
+
+        if let Some(max_entries) = max_entries.filter(|max_entries| *max_entries > 0) {
+            deleted += conn.execute(
+                "DELETE FROM notification_logs
+                 WHERE id NOT IN (
+                    SELECT id FROM notification_logs
+                    ORDER BY id DESC
+                    LIMIT ?1
+                 )",
+                params![i64::from(max_entries)],
+            )?;
+        }
+
+        Ok(deleted)
+    }
+
     pub fn get_sms_stats(&self) -> Result<SmsStats> {
         let conn = self.conn.lock().unwrap();
 

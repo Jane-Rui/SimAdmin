@@ -521,6 +521,7 @@ pub struct DdnsEvent {
     pub status: String,
     pub message: String,
     pub timestamp: String,
+    pub failure_count: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

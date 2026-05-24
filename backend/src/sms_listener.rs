@@ -98,6 +98,10 @@ fn sms_timestamp(incoming: &IncomingSms, mode: SmsIngestMode) -> String {
     }
 }
 
+fn should_forward_after_insert(mode: SmsIngestMode, forward_reconciled_new_sms: bool) -> bool {
+    mode == SmsIngestMode::Live || forward_reconciled_new_sms
+}
+
 /// 从 SMS 对象路径读取短信内容
 async fn read_sms_content(conn: &Connection, sms_path: &str) -> Option<IncomingSms> {
     let proxy = Proxy::new(conn, MM_SERVICE, sms_path, DBUS_PROPERTIES)
@@ -192,6 +196,7 @@ async fn process_sms_path(
     modem_path: &str,
     sms_path: &str,
     mode: SmsIngestMode,
+    forward_reconciled_new_sms: bool,
 ) {
     let Some(incoming) = read_sms_content(conn, sms_path).await else {
         return;
@@ -268,7 +273,7 @@ async fn process_sms_path(
                 status: "received".to_string(),
                 pdu: Some(marker),
             };
-            if mode == SmsIngestMode::Live {
+            if should_forward_after_insert(mode, forward_reconciled_new_sms) {
                 let notification_sender = Arc::clone(notification_sender);
                 tokio::spawn(async move {
                     let _ = notification_sender.forward_sms(&sms).await;
@@ -295,6 +300,7 @@ async fn scan_sms_paths(
     notification_sender: &Arc<NotificationSender>,
     modem_path: &str,
     reason: &str,
+    forward_new_sms: bool,
 ) {
     match list_sms_paths(conn, modem_path).await {
         Ok(paths) => {
@@ -314,6 +320,7 @@ async fn scan_sms_paths(
                     modem_path,
                     &sms_path,
                     SmsIngestMode::Reconcile,
+                    forward_new_sms,
                 )
                 .await;
             }
@@ -335,10 +342,19 @@ async fn scan_current_modem_or_rebind(
     notification_sender: &Arc<NotificationSender>,
     modem_path: &str,
     reason: &str,
+    forward_new_sms: bool,
 ) -> bool {
     match find_modem_path(conn).await {
         Ok(current_path) if current_path == modem_path => {
-            scan_sms_paths(conn, db, notification_sender, modem_path, reason).await;
+            scan_sms_paths(
+                conn,
+                db,
+                notification_sender,
+                modem_path,
+                reason,
+                forward_new_sms,
+            )
+            .await;
             true
         }
         Ok(current_path) => {
@@ -348,7 +364,15 @@ async fn scan_current_modem_or_rebind(
                 reason = %reason,
                 "SMS listener detected modem path change"
             );
-            scan_sms_paths(conn, db, notification_sender, current_path.as_str(), reason).await;
+            scan_sms_paths(
+                conn,
+                db,
+                notification_sender,
+                current_path.as_str(),
+                reason,
+                false,
+            )
+            .await;
             false
         }
         Err(e) => {
@@ -420,6 +444,7 @@ pub async fn start_sms_listener(
             &notification_sender,
             modem_path.as_str(),
             "initial",
+            false,
         )
         .await;
 
@@ -462,6 +487,7 @@ pub async fn start_sms_listener(
                                     modem_path.as_str(),
                                     &sms_path_str,
                                     SmsIngestMode::Live,
+                                    false,
                                 )
                                 .await;
                             }
@@ -475,6 +501,7 @@ pub async fn start_sms_listener(
                         &notification_sender,
                         modem_path.as_str(),
                         "poll",
+                        true,
                     ).await {
                         break;
                     }
@@ -487,6 +514,7 @@ pub async fn start_sms_listener(
                         &notification_sender,
                         modem_path.as_str(),
                         request.reason.as_str(),
+                        false,
                     ).await {
                         break;
                     }
@@ -529,5 +557,19 @@ mod tests {
     #[test]
     fn rejects_unparseable_sms_timestamp() {
         assert_eq!(normalize_sms_timestamp_for_display("not-a-date"), None);
+    }
+
+    #[test]
+    fn forwards_live_sms_after_insert() {
+        assert!(should_forward_after_insert(SmsIngestMode::Live, false));
+    }
+
+    #[test]
+    fn forwards_reconciled_sms_only_when_enabled_for_scan() {
+        assert!(should_forward_after_insert(SmsIngestMode::Reconcile, true));
+        assert!(!should_forward_after_insert(
+            SmsIngestMode::Reconcile,
+            false
+        ));
     }
 }

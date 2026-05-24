@@ -1,16 +1,19 @@
 use crate::config::{
     BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, FeishuRobotConfig,
-    MessageChannelConfig, NotificationChannel, NotificationConfig, PushPlusConfig, TelegramConfig,
-    WebhookConfig, WecomAppConfig, WecomRobotConfig,
+    LegacyNotificationConfig, MatcherOperator, MessageChannelConfig, NotificationChannel,
+    NotificationChannelInstance, NotificationConfig, NotificationEventType, NotificationRule,
+    PushPlusConfig, QuietHoursSchedule, TelegramConfig, WebhookConfig, WecomAppConfig,
+    WecomRobotConfig,
 };
 use crate::db::{CallRecord, Database, SmsMessage};
 use crate::models::{DdnsEvent, VersionUpdateEvent};
 use crate::modem_manager::get_sim_info_data_with_cache;
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Timelike, Utc};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::{Client, StatusCode};
 use ring::hmac;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -56,6 +59,109 @@ struct SmsTemplateContext {
     own_number: String,
 }
 
+#[derive(Default)]
+struct NotificationRouteResult {
+    attempted: bool,
+    delivered: bool,
+    has_failures: bool,
+    errors: Vec<String>,
+}
+
+enum NotificationEvent<'a> {
+    Sms {
+        message: &'a SmsMessage,
+        context: &'a SmsTemplateContext,
+    },
+    Ddns(&'a DdnsEvent),
+    VersionUpdate(&'a VersionUpdateEvent),
+}
+
+impl NotificationEvent<'_> {
+    fn event_type(&self) -> NotificationEventType {
+        match self {
+            NotificationEvent::Sms { .. } => NotificationEventType::Sms,
+            NotificationEvent::Ddns(_) => NotificationEventType::Ddns,
+            NotificationEvent::VersionUpdate(_) => NotificationEventType::VersionUpdate,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self {
+            NotificationEvent::Sms { .. } => "SimAdmin 短信通知",
+            NotificationEvent::Ddns(_) => "SimAdmin DDNS 通知",
+            NotificationEvent::VersionUpdate(_) => "SimAdmin 版本更新",
+        }
+    }
+
+    fn summary(&self) -> String {
+        match self {
+            NotificationEvent::Sms { message, .. } => {
+                compact_summary(&format!("[{}] {}", message.phone_number, message.content))
+            }
+            NotificationEvent::Ddns(event) => compact_summary(&format!(
+                "{} {} {}",
+                event.domains.join(", "),
+                event.status,
+                event.message
+            )),
+            NotificationEvent::VersionUpdate(event) => compact_summary(&format!(
+                "{} {} {}",
+                event.version, event.asset_name, event.commit
+            )),
+        }
+    }
+
+    fn field_value(&self, field: &str) -> String {
+        match self {
+            NotificationEvent::Sms { message, context } => match field {
+                "phone_number" => message.phone_number.clone(),
+                "content" => message.content.clone(),
+                "own_number" => context.own_number.clone(),
+                "direction" => message.direction.clone(),
+                "status" => message.status.clone(),
+                _ => self.summary(),
+            },
+            NotificationEvent::Ddns(event) => match field {
+                "domains" | "domain" => event.domains.join(", "),
+                "provider" => event.provider.clone(),
+                "record_type" => event.record_type.clone(),
+                "status" => event.status.clone(),
+                "message" => event.message.clone(),
+                "new_ip" => event.new_ip.clone().unwrap_or_default(),
+                "old_ip" => event.old_ip.clone().unwrap_or_default(),
+                "failure_count" => event.failure_count.to_string(),
+                _ => self.summary(),
+            },
+            NotificationEvent::VersionUpdate(event) => match field {
+                "asset_name" => event.asset_name.clone(),
+                "version" => event.version.clone(),
+                "commit" => event.commit.clone(),
+                "build_time" => event.build_time.clone(),
+                "md5" => event.md5.clone(),
+                _ => self.summary(),
+            },
+        }
+    }
+
+    fn render(&self, template: &str) -> String {
+        let template = if template.trim().is_empty() {
+            crate::config::default_rule_template(self.event_type())
+        } else {
+            template.to_string()
+        };
+        match self {
+            NotificationEvent::Sms { message, context } => {
+                render_sms_template(&template, message, context, false)
+            }
+            NotificationEvent::Ddns(event) => render_ddns_template(&template, event, false),
+            NotificationEvent::VersionUpdate(event) => {
+                render_version_update_template(&template, event, false)
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 impl NotificationSender {
     /// Create a new sender.
     pub fn new(
@@ -92,33 +198,19 @@ impl NotificationSender {
 
     /// Forward an incoming SMS to all enabled channels.
     pub async fn forward_sms(&self, message: &SmsMessage) -> Result<(), String> {
-        let config = self.get_config();
         let context = self.sms_template_context().await;
-        let mut attempted = false;
-        let mut delivered = false;
-        let mut errors = Vec::new();
+        let event = NotificationEvent::Sms {
+            message,
+            context: &context,
+        };
+        let result = self.route_event(&event).await;
 
-        for channel in all_channels() {
-            if !should_send_sms_to_channel(channel, &config) {
-                continue;
-            }
-
-            attempted = true;
-            match self
-                .send_sms_to_channel(channel, &config, message, &context, false)
-                .await
-            {
-                Ok(_) => delivered = true,
-                Err(err) => errors.push(format!("{}: {}", channel.label(), err)),
-            }
-        }
-
-        let notification_status = if !attempted {
-            "skipped"
-        } else if delivered {
+        let notification_status = if result.delivered {
             "success"
-        } else {
+        } else if result.attempted && result.has_failures {
             "failed"
+        } else {
+            "skipped"
         };
 
         if message.id > 0 {
@@ -135,66 +227,51 @@ impl NotificationSender {
             }
         }
 
-        if delivered && !errors.is_empty() {
+        if result.delivered && !result.errors.is_empty() {
             warn!(
                 sms_id = message.id,
-                errors = %errors.join("; "),
+                errors = %result.errors.join("; "),
                 "SMS notification partially failed"
             );
         }
 
-        if errors.is_empty() || delivered {
+        if result.errors.is_empty() || result.delivered {
             Ok(())
         } else {
-            Err(errors.join("; "))
+            Err(result.errors.join("; "))
         }
     }
 
     /// Forward a call record to all enabled channels.
     #[allow(dead_code)]
-    pub async fn forward_call(&self, call: &CallRecord) -> Result<(), String> {
-        let config = self.get_config();
-        let mut errors = Vec::new();
-
-        for channel in all_channels() {
-            if let Err(err) = self
-                .send_call_to_channel(channel, &config, call, false)
-                .await
-            {
-                errors.push(format!("{}: {}", channel.label(), err));
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+    pub async fn forward_call(&self, _call: &CallRecord) -> Result<(), String> {
+        Ok(())
     }
 
     /// Forward a DDNS update/failure event to all enabled channels.
     pub async fn forward_ddns_event(&self, event: &DdnsEvent) -> Result<(), String> {
-        let config = self.get_config();
-        let mut errors = Vec::new();
+        let event = NotificationEvent::Ddns(event);
+        let result = self.route_event(&event).await;
 
-        for channel in all_channels() {
-            if let Err(err) = self.send_ddns_to_channel(channel, &config, event).await {
-                errors.push(format!("{}: {}", channel.label(), err));
-            }
-        }
-
-        if errors.is_empty() {
+        if result.errors.is_empty() || result.delivered {
             Ok(())
         } else {
-            Err(errors.join("; "))
+            Err(result.errors.join("; "))
         }
     }
 
     pub fn has_version_update_targets(&self) -> bool {
         let config = self.get_config();
-        all_channels()
-            .into_iter()
-            .any(|channel| should_send_update_to_channel(channel, &config))
+        config.rules.iter().any(|rule| {
+            rule.enabled
+                && rule.event_type == NotificationEventType::VersionUpdate
+                && rule.channel_ids.iter().any(|channel_id| {
+                    config
+                        .channels
+                        .iter()
+                        .any(|channel| channel.enabled && channel.id == *channel_id)
+                })
+        })
     }
 
     /// Forward a newly available version update to enabled channels.
@@ -202,93 +279,269 @@ impl NotificationSender {
         &self,
         event: &VersionUpdateEvent,
     ) -> Result<NotificationFanoutResult, String> {
-        let config = self.get_config();
-        let mut delivered = false;
-        let mut errors = Vec::new();
+        let event = NotificationEvent::VersionUpdate(event);
+        let result = self.route_event(&event).await;
 
-        for channel in all_channels() {
-            if !should_send_update_to_channel(channel, &config) {
-                continue;
-            }
-
-            match self
-                .send_version_update_to_channel(channel, &config, event)
-                .await
-            {
-                Ok(_) => delivered = true,
-                Err(err) => errors.push(format!("{}: {}", channel.label(), err)),
-            }
-        }
-
-        if delivered || errors.is_empty() {
-            Ok(NotificationFanoutResult { delivered, errors })
+        if result.delivered || result.errors.is_empty() {
+            Ok(NotificationFanoutResult {
+                delivered: result.delivered,
+                errors: result.errors,
+            })
         } else {
-            Err(errors.join("; "))
+            Err(result.errors.join("; "))
         }
     }
 
     /// Test a specific notification channel with a simulated SMS.
-    pub async fn test_channel(&self, channel: NotificationChannel) -> Result<String, String> {
+    pub async fn test_channel(&self, target: &str) -> Result<String, String> {
         let config = self.get_config();
-        let test_message = SmsMessage {
-            id: 0,
-            direction: "incoming".to_string(),
-            phone_number: "+10000".to_string(),
-            content: "这是一条测试短信 (Notification Test)".to_string(),
-            timestamp: beijing_now_string(),
-            status: "received".to_string(),
-            pdu: None,
-        };
+        let channel = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == target)
+            .or_else(|| {
+                serde_json::from_value::<NotificationChannel>(json!(target))
+                    .ok()
+                    .and_then(|channel_type| {
+                        config
+                            .channels
+                            .iter()
+                            .find(|channel| channel.channel_type == channel_type)
+                    })
+            })
+            .ok_or_else(|| "Notification channel is not configured".to_string())?;
 
-        let context = self.sms_template_context().await;
-        self.send_sms_to_channel(channel, &config, &test_message, &context, true)
+        let channel_type = channel.channel_type.label();
+        let text = format!(
+            "{channel_type} 信使打卡成功✅\n服务支持：SimAdmin 开源项目\n简介：一站式 SIM/eSIM 蜂窝设备管理系统\nGitHub：https://github.com/3899/SimAdmin"
+        );
+
+        self.send_text_to_channel(channel, &format!("{channel_type} 信使打卡成功✅"), &text)
             .await
     }
 
-    async fn send_sms_to_channel(
-        &self,
-        channel: NotificationChannel,
-        config: &NotificationConfig,
-        message: &SmsMessage,
-        context: &SmsTemplateContext,
-        force: bool,
-    ) -> Result<String, String> {
-        match channel {
-            NotificationChannel::Webhook => {
-                self.send_webhook_sms(&config.webhook, message, context, force)
+    async fn route_event(&self, event: &NotificationEvent<'_>) -> NotificationRouteResult {
+        let config = self.get_config();
+        let mut result = NotificationRouteResult::default();
+        let summary = event.summary();
+        let mut matched_rules = 0usize;
+
+        for rule in config
+            .rules
+            .iter()
+            .filter(|rule| rule.enabled && rule.event_type == event.event_type())
+        {
+            if !rule_matches(rule, event) {
+                continue;
+            }
+            matched_rules += 1;
+
+            if let Some(message) = ddns_failure_threshold_waiting(rule, event) {
+                self.record_notification_log(
+                    event.event_type(),
+                    "threshold_waiting",
+                    &summary,
+                    Some(rule),
+                    None,
+                    &message,
+                );
+                continue;
+            }
+
+            if rule.channel_ids.is_empty() {
+                self.record_notification_log(
+                    event.event_type(),
+                    "no_available_channel",
+                    &summary,
+                    Some(rule),
+                    None,
+                    "规则未选择通知通道",
+                );
+                continue;
+            }
+
+            let text = event.render(&rule.template);
+            let quiet = quiet_hours_active(&rule.quiet_hours);
+            for channel_id in &rule.channel_ids {
+                result.attempted = true;
+                let channel = config.channels.iter().find(|item| item.id == *channel_id);
+                let Some(channel) = channel else {
+                    self.record_notification_log(
+                        event.event_type(),
+                        "no_available_channel",
+                        &summary,
+                        Some(rule),
+                        None,
+                        "通知通道不存在",
+                    );
+                    continue;
+                };
+
+                if quiet {
+                    self.record_notification_log(
+                        event.event_type(),
+                        "quiet_hours",
+                        &summary,
+                        Some(rule),
+                        Some(channel),
+                        "免打扰时间段内，已跳过发送",
+                    );
+                    continue;
+                }
+
+                if !channel.enabled {
+                    self.record_notification_log(
+                        event.event_type(),
+                        "no_available_channel",
+                        &summary,
+                        Some(rule),
+                        Some(channel),
+                        "通知通道已停用",
+                    );
+                    continue;
+                }
+
+                match self
+                    .send_text_to_channel(channel, event.title(), &text)
                     .await
+                {
+                    Ok(message) => {
+                        result.delivered = true;
+                        self.record_notification_log(
+                            event.event_type(),
+                            "success",
+                            &summary,
+                            Some(rule),
+                            Some(channel),
+                            &message,
+                        );
+                    }
+                    Err(err) => {
+                        result.has_failures = true;
+                        result.errors.push(format!("{}: {}", channel.name, err));
+                        self.record_notification_log(
+                            event.event_type(),
+                            "failed",
+                            &summary,
+                            Some(rule),
+                            Some(channel),
+                            &err,
+                        );
+                    }
+                }
+            }
+        }
+
+        if matched_rules == 0 {
+            self.record_notification_log(
+                event.event_type(),
+                "unmatched",
+                &summary,
+                None,
+                None,
+                "没有匹配的启用转发规则",
+            );
+        }
+
+        result
+    }
+
+    fn record_notification_log(
+        &self,
+        event_type: NotificationEventType,
+        status: &str,
+        summary: &str,
+        rule: Option<&NotificationRule>,
+        channel: Option<&NotificationChannelInstance>,
+        message: &str,
+    ) {
+        let (rule_id, rule_name) = rule
+            .map(|rule| (rule.id.as_str(), rule.name.as_str()))
+            .unwrap_or(("", ""));
+        let (channel_id, channel_name) = channel
+            .map(|channel| (channel.id.as_str(), channel.name.as_str()))
+            .unwrap_or(("", ""));
+        if let Err(err) = self
+            .database
+            .insert_notification_log(crate::db::NewNotificationLog {
+                event_type: notification_event_type_key(event_type),
+                status,
+                summary,
+                rule_id,
+                rule_name,
+                channel_id,
+                channel_name,
+                message,
+            })
+        {
+            warn!(error = %err, "Failed to insert notification log");
+            return;
+        }
+
+        let config = self.get_config();
+        let retention_days = config
+            .log_cleanup
+            .retention_days_enabled
+            .then_some(config.log_cleanup.retention_days);
+        let max_entries = config
+            .log_cleanup
+            .max_entries_enabled
+            .then_some(config.log_cleanup.max_entries);
+        if retention_days.is_some() || max_entries.is_some() {
+            if let Err(err) = self
+                .database
+                .cleanup_notification_logs(retention_days, max_entries)
+            {
+                warn!(error = %err, "Failed to auto cleanup notification logs");
+            }
+        }
+    }
+
+    async fn send_text_to_channel(
+        &self,
+        channel: &NotificationChannelInstance,
+        title: &str,
+        text: &str,
+    ) -> Result<String, String> {
+        match channel.channel_type {
+            NotificationChannel::Webhook => {
+                let config = parse_instance_config::<WebhookConfig>(channel)?;
+                self.send_webhook_text(&config, text).await
             }
             NotificationChannel::Bark => {
-                self.send_bark_sms(&config.bark, message, context, force)
+                let config = parse_instance_config::<BarkConfig>(channel)?;
+                self.send_bark_message(&config, title.to_string(), text.to_string())
                     .await
             }
             NotificationChannel::PushPlus => {
-                self.send_pushplus_sms(&config.pushplus, message, context, force)
+                let config = parse_instance_config::<PushPlusConfig>(channel)?;
+                self.send_pushplus_message(&config, title.to_string(), text.to_string())
                     .await
             }
             NotificationChannel::WecomApp => {
-                self.send_wecom_app_sms(&config.wecom_app, message, context, force)
-                    .await
+                let config = parse_instance_config::<WecomAppConfig>(channel)?;
+                self.send_wecom_app_text(&config, text.to_string()).await
             }
             NotificationChannel::WecomRobot => {
-                self.send_wecom_robot_sms(&config.wecom_robot, message, context, force)
-                    .await
+                let config = parse_instance_config::<WecomRobotConfig>(channel)?;
+                self.send_wecom_robot_text(&config, text.to_string()).await
             }
             NotificationChannel::DingtalkRobot => {
-                self.send_dingtalk_robot_sms(&config.dingtalk_robot, message, context, force)
+                let config = parse_instance_config::<DingtalkRobotConfig>(channel)?;
+                self.send_dingtalk_robot_text(&config, text.to_string())
                     .await
             }
             NotificationChannel::DingtalkApp => {
-                self.send_dingtalk_app_sms(&config.dingtalk_app, message, context, force)
-                    .await
+                let config = parse_instance_config::<DingtalkAppConfig>(channel)?;
+                self.send_dingtalk_app_text(&config, text.to_string()).await
             }
             NotificationChannel::FeishuRobot => {
-                self.send_feishu_robot_sms(&config.feishu_robot, message, context, force)
-                    .await
+                let config = parse_instance_config::<FeishuRobotConfig>(channel)?;
+                self.send_feishu_robot_text(&config, text.to_string()).await
             }
             NotificationChannel::Telegram => {
-                self.send_telegram_sms(&config.telegram, message, context, force)
-                    .await
+                let config = parse_instance_config::<TelegramConfig>(channel)?;
+                self.send_telegram_text(&config, text.to_string()).await
             }
         }
     }
@@ -296,7 +549,7 @@ impl NotificationSender {
     async fn send_call_to_channel(
         &self,
         channel: NotificationChannel,
-        config: &NotificationConfig,
+        config: &LegacyNotificationConfig,
         call: &CallRecord,
         force: bool,
     ) -> Result<String, String> {
@@ -337,7 +590,7 @@ impl NotificationSender {
     async fn send_ddns_to_channel(
         &self,
         channel: NotificationChannel,
-        config: &NotificationConfig,
+        config: &LegacyNotificationConfig,
         event: &DdnsEvent,
     ) -> Result<String, String> {
         match channel {
@@ -369,7 +622,7 @@ impl NotificationSender {
     async fn send_version_update_to_channel(
         &self,
         channel: NotificationChannel,
-        config: &NotificationConfig,
+        config: &LegacyNotificationConfig,
         event: &VersionUpdateEvent,
     ) -> Result<String, String> {
         match channel {
@@ -502,6 +755,46 @@ impl NotificationSender {
 
         let response = request
             .body(payload.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send webhook: {}", e))?;
+        response_result(
+            "Webhook",
+            response.status(),
+            response.text().await.unwrap_or_default(),
+        )
+    }
+
+    async fn send_webhook_text(
+        &self,
+        config: &WebhookConfig,
+        text: &str,
+    ) -> Result<String, String> {
+        if config.url.trim().is_empty() {
+            return Err("Webhook URL is not configured".to_string());
+        }
+
+        let mut request = self.client.post(config.url.trim());
+        let mut has_content_type = false;
+
+        for (key, value) in &config.headers {
+            if key.eq_ignore_ascii_case("content-type") {
+                has_content_type = true;
+            }
+            request = request.header(key, value);
+        }
+
+        if !has_content_type {
+            request = request.header("Content-Type", "text/plain; charset=utf-8");
+        }
+
+        if !config.secret.trim().is_empty() {
+            let signature = compute_legacy_signature(config.secret.trim(), text);
+            request = request.header("X-Webhook-Signature", signature);
+        }
+
+        let response = request
+            .body(text.to_string())
             .send()
             .await
             .map_err(|e| format!("Failed to send webhook: {}", e))?;
@@ -1404,6 +1697,138 @@ impl NotificationSender {
     }
 }
 
+fn parse_instance_config<T>(channel: &NotificationChannelInstance) -> Result<T, String>
+where
+    T: DeserializeOwned + Default,
+{
+    if channel.config.is_null() {
+        return Ok(T::default());
+    }
+    serde_json::from_value(channel.config.clone())
+        .map_err(|err| format!("Failed to parse {} channel config: {}", channel.name, err))
+}
+
+fn rule_matches(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool {
+    let value = event.field_value(rule.matcher.field.as_str());
+    let expected = rule.matcher.value.trim();
+    match rule.matcher.operator {
+        MatcherOperator::Always => true,
+        MatcherOperator::Contains => {
+            expected.is_empty() || value.to_lowercase().contains(&expected.to_lowercase())
+        }
+        MatcherOperator::NotContains => {
+            expected.is_empty() || !value.to_lowercase().contains(&expected.to_lowercase())
+        }
+        MatcherOperator::Equals => value.trim() == expected,
+        MatcherOperator::Regex => {
+            if expected.is_empty() {
+                true
+            } else {
+                regex_automata::meta::Regex::new(expected)
+                    .map(|regex| regex.is_match(value.as_bytes()))
+                    .unwrap_or(false)
+            }
+        }
+    }
+}
+
+fn ddns_failure_threshold_waiting(
+    rule: &NotificationRule,
+    event: &NotificationEvent<'_>,
+) -> Option<String> {
+    let NotificationEvent::Ddns(ddns) = event else {
+        return None;
+    };
+    if ddns.status != "failed" {
+        return None;
+    }
+
+    let threshold = rule.ddns_failure_threshold.max(1);
+    if threshold <= 1 {
+        return None;
+    }
+
+    let failure_count = ddns.failure_count;
+    if failure_count > 0 && failure_count % threshold == 0 {
+        return None;
+    }
+
+    let next_threshold = if failure_count == 0 {
+        threshold
+    } else {
+        ((failure_count / threshold) + 1).saturating_mul(threshold)
+    };
+    Some(format!(
+        "DDNS 连续失败 {failure_count} 次，下一次推送阈值为 {next_threshold} 次"
+    ))
+}
+
+fn quiet_hours_active(schedules: &[QuietHoursSchedule]) -> bool {
+    let now = Utc::now().with_timezone(&beijing_offset());
+    let weekday = now.weekday().number_from_monday() as u8;
+    let minutes = now.hour() as u16 * 60 + now.minute() as u16;
+
+    schedules
+        .iter()
+        .filter(|schedule| schedule.enabled)
+        .any(|schedule| quiet_schedule_matches(schedule, weekday, minutes))
+}
+
+fn quiet_schedule_matches(schedule: &QuietHoursSchedule, weekday: u8, minutes: u16) -> bool {
+    let weekdays = if schedule.weekdays.is_empty() {
+        vec![1, 2, 3, 4, 5, 6, 7]
+    } else {
+        schedule.weekdays.clone()
+    };
+    let Some(start) = parse_hhmm(&schedule.start) else {
+        return false;
+    };
+    let Some(end) = parse_hhmm(&schedule.end) else {
+        return false;
+    };
+
+    if start == end {
+        return weekdays.contains(&weekday);
+    }
+    if start < end {
+        return weekdays.contains(&weekday) && minutes >= start && minutes < end;
+    }
+
+    let previous_weekday = if weekday == 1 { 7 } else { weekday - 1 };
+    (weekdays.contains(&weekday) && minutes >= start)
+        || (weekdays.contains(&previous_weekday) && minutes < end)
+}
+
+fn parse_hhmm(value: &str) -> Option<u16> {
+    let (hour, minute) = value.split_once(':')?;
+    let hour = hour.parse::<u16>().ok()?;
+    let minute = minute.parse::<u16>().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(hour * 60 + minute)
+}
+
+fn notification_event_type_key(event_type: NotificationEventType) -> &'static str {
+    match event_type {
+        NotificationEventType::Sms => "sms",
+        NotificationEventType::Ddns => "ddns",
+        NotificationEventType::VersionUpdate => "version_update",
+    }
+}
+
+fn compact_summary(value: &str) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let summary = chars.by_ref().take(120).collect::<String>();
+    if chars.next().is_some() {
+        format!("{}...", summary)
+    } else {
+        summary
+    }
+}
+
+#[allow(dead_code)]
 impl NotificationChannel {
     fn label(self) -> &'static str {
         match self {
@@ -1420,6 +1845,7 @@ impl NotificationChannel {
     }
 }
 
+#[allow(dead_code)]
 fn all_channels() -> [NotificationChannel; 9] {
     [
         NotificationChannel::Webhook,
@@ -1434,11 +1860,16 @@ fn all_channels() -> [NotificationChannel; 9] {
     ]
 }
 
+#[allow(dead_code)]
 fn should_send_sms(config: &MessageChannelConfig, force: bool) -> bool {
     force || (config.enabled && config.forward_sms)
 }
 
-fn should_send_sms_to_channel(channel: NotificationChannel, config: &NotificationConfig) -> bool {
+#[allow(dead_code)]
+fn should_send_sms_to_channel(
+    channel: NotificationChannel,
+    config: &LegacyNotificationConfig,
+) -> bool {
     match channel {
         NotificationChannel::Webhook => config.webhook.enabled && config.webhook.forward_sms,
         NotificationChannel::Bark => should_send_sms(&config.bark.common, false),
@@ -1452,21 +1883,25 @@ fn should_send_sms_to_channel(channel: NotificationChannel, config: &Notificatio
     }
 }
 
+#[allow(dead_code)]
 fn should_send_call(config: &MessageChannelConfig, force: bool) -> bool {
     force || (config.enabled && config.forward_calls)
 }
 
+#[allow(dead_code)]
 fn should_send_ddns(config: &MessageChannelConfig) -> bool {
     config.enabled && config.forward_ddns
 }
 
+#[allow(dead_code)]
 fn should_send_update(config: &MessageChannelConfig) -> bool {
     config.enabled && config.forward_updates
 }
 
+#[allow(dead_code)]
 fn should_send_update_to_channel(
     channel: NotificationChannel,
-    config: &NotificationConfig,
+    config: &LegacyNotificationConfig,
 ) -> bool {
     match channel {
         NotificationChannel::Webhook => config.webhook.enabled && config.webhook.forward_updates,
@@ -1481,14 +1916,14 @@ fn should_send_update_to_channel(
     }
 }
 
-const DEFAULT_DDNS_TEXT_TEMPLATE: &str = "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}";
+const DEFAULT_DDNS_TEXT_TEMPLATE: &str = "SimAdmin DDNS 通知\n域名: {{域名}}\nIP类型: {{IP类型}}\n新IP: {{新IP}}\n旧IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}";
 const DEFAULT_DDNS_JSON_TEMPLATE: &str = r#"{
   "msg_type": "text",
   "content": {
     "text": "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}"
   }
 }"#;
-const DEFAULT_UPDATE_TEXT_TEMPLATE: &str = "SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n构建时间: {{build_time}}\nOTA包 MD5: {{md5}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。";
+const DEFAULT_UPDATE_TEXT_TEMPLATE: &str = "SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。";
 const DEFAULT_UPDATE_JSON_TEMPLATE: &str = r#"{
   "msg_type": "text",
   "content": {
@@ -1534,6 +1969,8 @@ fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) ->
     let message = maybe_escape(&event.message);
     let timestamp_value = format_notification_time(&event.timestamp);
     let timestamp = maybe_escape(&timestamp_value);
+    let failure_count_value = event.failure_count.to_string();
+    let failure_count = maybe_escape(&failure_count_value);
 
     template
         .replace("{{domains}}", &domains)
@@ -1545,6 +1982,7 @@ fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) ->
         .replace("{{record_type}}", &record_type)
         .replace("{{status}}", &status)
         .replace("{{message}}", &message)
+        .replace("{{failure_count}}", &failure_count)
         .replace("{{timestamp}}", &timestamp)
         .replace("{{time}}", &timestamp)
         .replace("{{域名}}", &domains)
@@ -1555,6 +1993,7 @@ fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) ->
         .replace("{{记录类型}}", &record_type)
         .replace("{{状态}}", &status)
         .replace("{{消息}}", &message)
+        .replace("{{失败次数}}", &failure_count)
         .replace("{{更新时间}}", &timestamp)
 }
 
@@ -1608,7 +2047,13 @@ fn render_version_update_template(
         .replace("{{固件包}}", &asset_name)
         .replace("{{文件名}}", &asset_name)
         .replace("{{版本号}}", &version)
+        .replace("{{提交}}", &commit)
         .replace("{{构建时间}}", &build_time)
+        .replace("{{校验值}}", &md5)
+        .replace("{{OTA包MD5}}", &md5)
+        .replace("{{二进制MD5}}", &binary_md5)
+        .replace("{{前端MD5}}", &frontend_md5)
+        .replace("{{发布地址}}", &release_url)
         .replace("{{发布时间}}", &timestamp)
 }
 
@@ -1758,14 +2203,24 @@ fn render_sms_template(
     template
         .replace("{{id}}", &message.id.to_string())
         .replace("{{phone_number}}", &message.phone_number)
+        .replace("{{发送方号码}}", &message.phone_number)
+        .replace("{{发送方}}", &message.phone_number)
+        .replace("{{发件人}}", &message.phone_number)
         .replace("{{own_number}}", &own_number)
         .replace("{{local_phone_number}}", &own_number)
         .replace("{{self_phone_number}}", &own_number)
         .replace("{{本机号码}}", &own_number)
         .replace("{{content}}", &content)
+        .replace("{{内容}}", &content)
+        .replace("{{短信内容}}", &content)
         .replace("{{direction}}", &message.direction)
+        .replace("{{短信方向}}", &message.direction)
+        .replace("{{方向}}", &message.direction)
         .replace("{{timestamp}}", &timestamp)
+        .replace("{{时间}}", &timestamp)
         .replace("{{status}}", &message.status)
+        .replace("{{短信状态}}", &message.status)
+        .replace("{{状态}}", &message.status)
         .replace("{{sender}}", &message.phone_number)
         .replace("{{message}}", &content)
         .replace("{{time}}", &timestamp)
@@ -1851,6 +2306,7 @@ fn render_time_value(value: &str, escape_json: bool) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn beijing_now_string() -> String {
     Utc::now()
         .with_timezone(&beijing_offset())
@@ -1906,6 +2362,107 @@ fn compute_legacy_signature(secret: &str, data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RuleMatcher;
+
+    #[test]
+    fn quiet_schedule_matches_weekday_and_overnight_range() {
+        let schedule = QuietHoursSchedule {
+            enabled: true,
+            weekdays: vec![1],
+            start: "22:00".to_string(),
+            end: "08:00".to_string(),
+        };
+
+        assert!(quiet_schedule_matches(&schedule, 1, 22 * 60));
+        assert!(quiet_schedule_matches(&schedule, 2, 7 * 60 + 59));
+        assert!(!quiet_schedule_matches(&schedule, 2, 8 * 60));
+        assert!(!quiet_schedule_matches(&schedule, 3, 7 * 60));
+    }
+
+    #[test]
+    fn rule_matcher_supports_contains_and_regex() {
+        let message = SmsMessage {
+            id: 1,
+            direction: "incoming".to_string(),
+            phone_number: "+10086".to_string(),
+            content: "Your code is 482910".to_string(),
+            timestamp: "2026-05-23 18:30:12".to_string(),
+            status: "received".to_string(),
+            pdu: None,
+        };
+        let context = SmsTemplateContext::default();
+        let event = NotificationEvent::Sms {
+            message: &message,
+            context: &context,
+        };
+
+        let contains_rule = NotificationRule {
+            id: "rule-1".to_string(),
+            event_type: NotificationEventType::Sms,
+            name: "验证码".to_string(),
+            enabled: true,
+            matcher: RuleMatcher {
+                field: "content".to_string(),
+                operator: MatcherOperator::Contains,
+                value: "code".to_string(),
+            },
+            channel_ids: Vec::new(),
+            template: String::new(),
+            quiet_hours: Vec::new(),
+            ddns_failure_threshold: 1,
+        };
+        assert!(rule_matches(&contains_rule, &event));
+
+        let regex_rule = NotificationRule {
+            matcher: RuleMatcher {
+                field: "content".to_string(),
+                operator: MatcherOperator::Regex,
+                value: r"\d{6}".to_string(),
+            },
+            ..contains_rule
+        };
+        assert!(rule_matches(&regex_rule, &event));
+    }
+
+    #[test]
+    fn ddns_failure_threshold_waits_until_threshold_multiple() {
+        let rule = NotificationRule {
+            id: "rule-ddns".to_string(),
+            event_type: NotificationEventType::Ddns,
+            name: "DDNS threshold".to_string(),
+            enabled: true,
+            matcher: RuleMatcher::default(),
+            channel_ids: Vec::new(),
+            template: String::new(),
+            quiet_hours: Vec::new(),
+            ddns_failure_threshold: 5,
+        };
+        let mut ddns = DdnsEvent {
+            status: "failed".to_string(),
+            failure_count: 4,
+            ..DdnsEvent::default()
+        };
+
+        let event = NotificationEvent::Ddns(&ddns);
+        assert!(ddns_failure_threshold_waiting(&rule, &event).is_some());
+
+        ddns.failure_count = 5;
+        let event = NotificationEvent::Ddns(&ddns);
+        assert!(ddns_failure_threshold_waiting(&rule, &event).is_none());
+
+        ddns.failure_count = 6;
+        let event = NotificationEvent::Ddns(&ddns);
+        assert!(ddns_failure_threshold_waiting(&rule, &event).is_some());
+
+        ddns.failure_count = 10;
+        let event = NotificationEvent::Ddns(&ddns);
+        assert!(ddns_failure_threshold_waiting(&rule, &event).is_none());
+
+        ddns.status = "updated".to_string();
+        ddns.failure_count = 1;
+        let event = NotificationEvent::Ddns(&ddns);
+        assert!(ddns_failure_threshold_waiting(&rule, &event).is_none());
+    }
 
     #[test]
     fn formats_rfc3339_time_as_beijing_time() {

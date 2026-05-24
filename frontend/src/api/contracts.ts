@@ -567,6 +567,10 @@ export type NotificationChannelKey =
   | 'feishu_robot'
   | 'telegram'
 
+export type NotificationEventType = 'sms' | 'ddns' | 'version_update'
+export type NotificationLogStatus = 'success' | 'failed' | 'no_available_channel' | 'quiet_hours' | 'unmatched' | 'threshold_waiting'
+export type MatcherOperator = 'always' | 'contains' | 'not_contains' | 'equals' | 'regex'
+
 export interface MessageChannelConfig {
   enabled: boolean
   forward_sms: boolean
@@ -648,15 +652,68 @@ export interface TelegramConfig extends MessageChannelConfig {
 }
 
 export interface NotificationConfig {
-  webhook: WebhookConfig
-  bark: BarkConfig
-  pushplus: PushPlusConfig
-  wecom_app: WecomAppConfig
-  wecom_robot: WecomRobotConfig
-  dingtalk_robot: DingtalkRobotConfig
-  dingtalk_app: DingtalkAppConfig
-  feishu_robot: FeishuRobotConfig
-  telegram: TelegramConfig
+  version: number
+  channels: NotificationChannelInstance[]
+  rules: NotificationRule[]
+  log_cleanup: NotificationLogCleanupConfig
+}
+
+export interface NotificationLogCleanupConfig {
+  retention_days_enabled: boolean
+  retention_days: number
+  max_entries_enabled: boolean
+  max_entries: number
+}
+
+export interface NotificationChannelInstance {
+  id: string
+  type: NotificationChannelKey
+  name: string
+  enabled: boolean
+  config: Record<string, unknown>
+}
+
+export interface RuleMatcher {
+  field: string
+  operator: MatcherOperator
+  value: string
+}
+
+export interface QuietHoursSchedule {
+  enabled: boolean
+  weekdays: number[]
+  start: string
+  end: string
+}
+
+export interface NotificationRule {
+  id: string
+  type: NotificationEventType
+  name: string
+  enabled: boolean
+  matcher: RuleMatcher
+  channel_ids: string[]
+  template: string
+  quiet_hours: QuietHoursSchedule[]
+  ddns_failure_threshold: number
+}
+
+export interface NotificationLogEntry {
+  id: number
+  event_type: NotificationEventType
+  status: NotificationLogStatus
+  summary: string
+  rule_id: string
+  rule_name: string
+  channel_id: string
+  channel_name: string
+  message: string
+  created_at: string
+}
+
+export interface NotificationLogsResponse {
+  logs: NotificationLogEntry[]
+  total: number
 }
 
 export const DEFAULT_SMS_TEMPLATE = `{

@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::fs;
 use std::process::{Command, Output};
@@ -2637,6 +2638,40 @@ pub async fn restart_service_handler() -> impl IntoResponse {
 use crate::config::ConfigManager;
 use crate::notification::NotificationSender;
 
+#[derive(Debug, Default, Deserialize)]
+pub struct NotificationLogQuery {
+    #[serde(default, rename = "type")]
+    pub event_type: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub start_date: String,
+    #[serde(default)]
+    pub end_date: String,
+    #[serde(default = "default_notification_log_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct NotificationLogClearRequest {
+    #[serde(default, rename = "type")]
+    pub event_type: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub start_date: String,
+    #[serde(default)]
+    pub end_date: String,
+}
+
+fn default_notification_log_limit() -> i64 {
+    50
+}
+
 /// GET /api/notifications/config
 pub async fn get_notification_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
@@ -2673,13 +2708,13 @@ pub async fn set_notification_config_handler(
 
 /// POST /api/notifications/test/{channel}
 pub async fn test_notification_channel_handler(
-    Path(channel): Path<crate::config::NotificationChannel>,
+    Path(channel): Path<String>,
     State(notification_sender): State<Arc<NotificationSender>>,
 ) -> (
     StatusCode,
     Json<ApiResponse<crate::models::WebhookTestResponse>>,
 ) {
-    match notification_sender.test_channel(channel).await {
+    match notification_sender.test_channel(&channel).await {
         Ok(message) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -2704,6 +2739,60 @@ pub async fn test_notification_channel_handler(
 }
 
 // ============ OTA 更新 ============
+
+/// GET /api/notifications/logs
+pub async fn get_notification_logs_handler(
+    Query(query): Query<NotificationLogQuery>,
+    State(database): State<Arc<Database>>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<crate::db::NotificationLogsResponse>>,
+) {
+    match database.get_notification_logs(
+        &query.event_type,
+        &query.status,
+        &query.q,
+        &query.start_date,
+        &query.end_date,
+        query.limit,
+        query.offset,
+    ) {
+        Ok(logs) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", logs)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {}", err))),
+        ),
+    }
+}
+
+/// POST /api/notifications/logs/clear
+pub async fn clear_notification_logs_handler(
+    State(database): State<Arc<Database>>,
+    payload: Option<Json<NotificationLogClearRequest>>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let filters = payload.map(|Json(value)| value).unwrap_or_default();
+    match database.clear_notification_logs(
+        &filters.event_type,
+        &filters.status,
+        &filters.start_date,
+        &filters.end_date,
+    ) {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Notification logs cleared",
+                json!({ "deleted": deleted }),
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {}", err))),
+        ),
+    }
+}
 
 /// GET /api/ota/status
 pub async fn get_ota_status_handler() -> impl IntoResponse {
