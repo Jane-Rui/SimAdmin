@@ -60,6 +60,7 @@ export interface EsimEuiccInfo {
   memory_total_kb?: number
   memory_available_kb?: number
   memory_total_customizable?: boolean
+  updated_at?: string
   raw: unknown
 }
 
@@ -84,6 +85,7 @@ export interface EsimProfile {
   mnc?: string
   disable_allowed?: boolean
   delete_allowed?: boolean
+  updated_at?: string
   raw: unknown
 }
 
