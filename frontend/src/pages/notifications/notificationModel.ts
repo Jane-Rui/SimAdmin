@@ -148,7 +148,6 @@ export const MATCH_FIELDS: Record<NotificationEventType, { value: string; label:
     { value: 'summary', label: '内容摘要' },
     { value: 'version', label: '版本号' },
     { value: 'asset_name', label: '固件包' },
-    { value: 'commit', label: 'Commit' },
   ],
   system_event: [],
   device_status: [],
@@ -158,10 +157,52 @@ export const MATCH_FIELDS: Record<NotificationEventType, { value: string; label:
 export const DEFAULT_TEMPLATES: Record<NotificationEventType, string> = {
   sms: '📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n来源: {{本机号码}}',
   ddns: 'DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}',
-  version_update: '🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n时间: {{时间}}\n来源: {{本机号码}}',
+  version_update: '🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}',
   system_event: DEFAULT_SYSTEM_EVENT_TEMPLATE,
   device_status: DEFAULT_DEVICE_STATUS_TEMPLATE,
   automation: '🤖 自动化事件通知\n任务名称: {{任务名称}}\n任务类型: {{任务类型}}\n执行状态: {{任务状态}}\n详情: {{任务详情}}\n时间: {{触发时间}}\n来源: {{本机号码}}',
+}
+
+export const DEFAULT_TITLE_TEMPLATES: Record<NotificationEventType, string> = {
+  sms: '{{发送方号码}}：验证码{{验证码}}',
+  ddns: 'DDNS通知：{{本机号码}}',
+  version_update: '版本更新通知：{{本机号码}}',
+  system_event: '{{分类}}事件：{{本机号码}}',
+  device_status: '设备状态：{{本机号码}}',
+  automation: '{{任务类型}}：{{本机号码}}',
+}
+
+export const TITLE_TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[]> = {
+  sms: [
+    { label: '发送方号码', token: '{{发送方号码}}' },
+    { label: '验证码', token: '{{验证码}}' },
+    { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
+  ],
+  ddns: [
+    { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
+  ],
+  version_update: [
+    { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
+  ],
+  system_event: [
+    { label: '分类', token: '{{分类}}' },
+    { label: '事件', token: '{{事件}}' },
+    { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
+  ],
+  device_status: [
+    { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
+  ],
+  automation: [
+    { label: '任务名称', token: '{{任务名称}}' },
+    { label: '任务类型', token: '{{任务类型}}' },
+    { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
+  ],
 }
 
 export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[]> = {
@@ -186,13 +227,15 @@ export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[
     { label: '消息', token: '{{消息}}' },
     { label: '失败次数', token: '{{失败次数}}' },
     { label: '更新时间', token: '{{更新时间}}' },
+    { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
   ],
   version_update: [
     { label: '固件包', token: '{{固件包}}' },
     { label: '版本号', token: '{{版本号}}' },
-    { label: 'Commit', token: '{{Commit}}' },
     { label: '时间', token: '{{时间}}' },
     { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
   ],
   system_event: SYSTEM_EVENT_TEMPLATE_VARIABLES,
   device_status: DEVICE_STATUS_TEMPLATE_VARIABLES,
@@ -203,6 +246,7 @@ export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[
     { label: '任务详情', token: '{{任务详情}}' },
     { label: '触发时间', token: '{{触发时间}}' },
     { label: '本机号码', token: '{{本机号码}}' },
+    { label: '运营商', token: '{{运营商}}' },
   ],
 }
 
@@ -215,6 +259,9 @@ function normalizeRule(rule: NotificationRule): NotificationRule {
   return {
     ...rule,
     event_codes: Array.isArray(rule.event_codes) ? rule.event_codes : [],
+    title_template: typeof rule.title_template === 'string' && rule.title_template.trim()
+      ? rule.title_template
+      : DEFAULT_TITLE_TEMPLATES[rule.type],
     device_status_items: Array.isArray(rule.device_status_items) ? rule.device_status_items : defaultDeviceStatusItems(),
     device_status_schedule: {
       mode: rule.device_status_schedule?.mode === 'interval' ? 'interval' : 'fixed',
@@ -281,9 +328,9 @@ export function defaultChannelConfig(type: NotificationChannelKey): Record<strin
     case 'webhook':
       return { url: '', secret: '', headers: {} }
     case 'bark':
-      return { server_url: 'https://api.day.app', device_key: '', title_template: 'SimAdmin 通知', group: '', sound: '', level: '', icon: '', auto_copy: true, save_history: true }
+      return { server_url: 'https://api.day.app', device_key: '', group: '', sound: '', level: '', icon: '', auto_copy: true, save_history: true }
     case 'pushplus':
-      return { token: '', title_template: 'SimAdmin 通知', topic: '', template: 'txt', channel: '', option: '', callback_url: '' }
+      return { token: '', topic: '', template: 'txt', channel: '', option: '', callback_url: '' }
     case 'wecom_app':
       return { corp_id: '', agent_id: '', secret: '', to_user: '@all', to_party: '', to_tag: '', safe: false }
     case 'wecom_robot':
@@ -381,6 +428,7 @@ export function createRule(type: NotificationEventType, channelIds: string[]): N
     device_status_items: type === 'device_status' ? defaultDeviceStatusItems() : [],
     device_status_schedule: { mode: 'fixed', interval_minutes: 1440, weekdays: [1, 2, 3, 4, 5, 6, 7], times: ['09:00'] },
     device_status_sms_period: 'last_24h',
+    title_template: DEFAULT_TITLE_TEMPLATES[type],
     template: DEFAULT_TEMPLATES[type],
     quiet_hours: [],
     ddns_failure_threshold: 1,

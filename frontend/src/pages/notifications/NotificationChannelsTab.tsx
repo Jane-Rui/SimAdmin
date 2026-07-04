@@ -319,7 +319,6 @@ export default function NotificationChannelsTab({
           <Box sx={fieldStackSx}>
             {renderStringField(channel, 'server_url', 'Server URL')}
             {renderStringField(channel, 'device_key', 'Device Key', { password: true })}
-            {renderStringField(channel, 'title_template', '标题模板')}
             {renderStringField(channel, 'group', '分组')}
             {renderStringField(channel, 'sound', '铃声')}
             {renderStringField(channel, 'level', '推送等级', { select: ['', 'active', 'timeSensitive', 'passive'] })}
@@ -334,7 +333,6 @@ export default function NotificationChannelsTab({
         return (
           <Box sx={fieldStackSx}>
             {renderStringField(channel, 'token', 'Token', { password: true })}
-            {renderStringField(channel, 'title_template', '标题模板')}
             {renderStringField(channel, 'topic', 'Topic')}
             {renderStringField(channel, 'template', 'Template', { select: ['', 'txt', 'html', 'markdown'] })}
             {renderStringField(channel, 'channel', 'Channel', { select: ['', 'wechat', 'webhook', 'cp', 'mail', 'sms', 'bark', 'gotify'] })}

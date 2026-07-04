@@ -448,6 +448,8 @@ pub struct NotificationRule {
     #[serde(default)]
     pub event_codes: Vec<String>,
     #[serde(default)]
+    pub title_template: String,
+    #[serde(default)]
     pub template: String,
     #[serde(default)]
     pub quiet_hours: Vec<QuietHoursSchedule>,
@@ -702,7 +704,7 @@ fn default_update_template() -> String {
     r#"{
   "msg_type": "text",
   "content": {
-    "text": "🚀 SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n时间: {{time}}\n来源: {{own_number}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。"
+    "text": "🚀 SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\n时间: {{time}}\n来源: {{own_number}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。"
   }
 }"#
     .to_string()
@@ -722,7 +724,7 @@ fn default_plain_ddns_template() -> String {
 }
 
 fn default_plain_update_template() -> String {
-    "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n时间: {{时间}}\n来源: {{本机号码}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。".to_string()
+    "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。".to_string()
 }
 
 fn default_sms_title_template() -> String {
@@ -1252,6 +1254,7 @@ fn push_legacy_rule(
             .map(|channel| channel.id.clone())
             .collect(),
         event_codes: Vec::new(),
+        title_template: default_rule_title_template(event_type),
         template,
         quiet_hours: Vec::new(),
         ddns_failure_threshold: default_ddns_failure_threshold(),
@@ -1297,7 +1300,7 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
             "DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}".to_string()
         }
         NotificationEventType::VersionUpdate => {
-            "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}\n来源: {{本机号码}}".to_string()
+            "🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}".to_string()
         }
         NotificationEventType::SystemEvent => {
             "系统事件通知\n分类: {{分类}}\n事件: {{事件}}\n等级: {{等级}}\n状态: {{状态}}\n对象: {{对象}}\n消息: {{消息}}\n时间: {{时间}}".to_string()
@@ -1308,6 +1311,17 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
         NotificationEventType::Automation => {
             "🤖 自动化事件通知\n任务名称: {{任务名称}}\n任务类型: {{任务类型}}\n执行状态: {{任务状态}}\n详情: {{任务详情}}\n时间: {{触发时间}}\n来源: {{本机号码}}".to_string()
         }
+    }
+}
+
+pub fn default_rule_title_template(event_type: NotificationEventType) -> String {
+    match event_type {
+        NotificationEventType::Sms => "{{发送方号码}}：验证码{{验证码}}".to_string(),
+        NotificationEventType::Ddns => "DDNS通知：{{本机号码}}".to_string(),
+        NotificationEventType::VersionUpdate => "版本更新通知：{{本机号码}}".to_string(),
+        NotificationEventType::SystemEvent => "{{分类}}事件：{{本机号码}}".to_string(),
+        NotificationEventType::DeviceStatus => "设备状态：{{本机号码}}".to_string(),
+        NotificationEventType::Automation => "{{任务类型}}：{{本机号码}}".to_string(),
     }
 }
 
@@ -1507,6 +1521,35 @@ mod tests {
             .iter()
             .any(|rule| rule.event_type == NotificationEventType::VersionUpdate));
     }
+
+    #[test]
+    fn update_template_migration_removes_obsolete_commit_and_md5_lines() {
+        let mut config = AppConfig::default();
+        config.notifications.rules.push(NotificationRule {
+            id: "rule-update".to_string(),
+            event_type: NotificationEventType::VersionUpdate,
+            name: "版本更新".to_string(),
+            enabled: true,
+            matcher: RuleMatcher::default(),
+            channel_ids: Vec::new(),
+            event_codes: Vec::new(),
+            title_template: String::new(),
+            template: "版本号: {{版本号}}\nCommit: {{Commit}}\n构建时间: {{构建时间}}\nMD5: {{MD5}}\n来源: {{本机号码}}".to_string(),
+            quiet_hours: Vec::new(),
+            ddns_failure_threshold: 1,
+            device_status_items: default_device_status_items(),
+            device_status_schedule: DeviceStatusSchedule::default(),
+            device_status_sms_period: "last_24h".to_string(),
+        });
+
+        assert!(migrate_update_templates(&mut config));
+
+        let template = &config.notifications.rules[0].template;
+        assert_eq!(
+            template,
+            "版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}"
+        );
+    }
 }
 
 fn default_ddns_provider() -> String {
@@ -1691,7 +1734,7 @@ fn migrate_legacy_webhook_config(config: &mut AppConfig) {
         .unwrap_or_else(WebhookConfig::default);
 }
 
-fn migrate_template_string(template: &mut String) -> bool {
+fn migrate_update_template_string(template: &mut String) -> bool {
     let mut changed = false;
     let md5_patterns = [
         "OTA包 MD5: {{md5}}",
@@ -1709,8 +1752,20 @@ fn migrate_template_string(template: &mut String) -> bool {
         "{{binary_md5}}",
         "{{frontend_md5}}",
     ];
+    let commit_patterns = [
+        "Commit: {{commit}}",
+        "Commit: {{Commit}}",
+        "commit: {{commit}}",
+        "commit: {{Commit}}",
+        "提交: {{commit}}",
+        "提交: {{Commit}}",
+        "发布目标: {{target_commitish}}",
+        "{{commit}}",
+        "{{Commit}}",
+        "{{target_commitish}}",
+    ];
 
-    for pattern in md5_patterns {
+    for pattern in md5_patterns.into_iter().chain(commit_patterns) {
         // Try replacing with leading newline (escaped JSON or real)
         let with_escaped_newline = format!("\\n{}", pattern);
         if template.contains(&with_escaped_newline) {
@@ -1758,18 +1813,18 @@ fn migrate_template_string(template: &mut String) -> bool {
     changed
 }
 
-fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
+fn migrate_update_templates(config: &mut AppConfig) -> bool {
     let mut changed = false;
 
     // 1. Webhook template
-    if migrate_template_string(&mut config.webhook.update_template) {
+    if migrate_update_template_string(&mut config.webhook.update_template) {
         changed = true;
     }
 
     // 2. Notification rules templates
     for rule in &mut config.notifications.rules {
         if rule.event_type == NotificationEventType::VersionUpdate {
-            if migrate_template_string(&mut rule.template) {
+            if migrate_update_template_string(&mut rule.template) {
                 changed = true;
             }
         }
@@ -1781,13 +1836,13 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
             // E.g. BarkConfig, PushPlusConfig, WecomAppConfig etc have nested "common"
             if let Some(common) = obj.get_mut("common").and_then(|v| v.as_object_mut()) {
                 if let Some(serde_json::Value::String(tpl)) = common.get_mut("update_template") {
-                    if migrate_template_string(tpl) {
+                    if migrate_update_template_string(tpl) {
                         changed = true;
                     }
                 }
             }
             if let Some(serde_json::Value::String(tpl)) = obj.get_mut("update_template") {
-                if migrate_template_string(tpl) {
+                if migrate_update_template_string(tpl) {
                     changed = true;
                 }
             }
@@ -1826,7 +1881,7 @@ impl ConfigManager {
         };
 
         migrate_legacy_webhook_config(&mut config);
-        let changed = migrate_templates_to_remove_md5(&mut config);
+        let changed = migrate_update_templates(&mut config);
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),

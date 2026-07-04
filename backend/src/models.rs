@@ -1009,7 +1009,6 @@ pub struct OtaLatestReleaseResponse {
 pub struct VersionUpdateEvent {
     pub asset_name: String,
     pub version: String,
-    pub commit: String,
     pub build_time: String,
     pub release_url: String,
     pub timestamp: String,
