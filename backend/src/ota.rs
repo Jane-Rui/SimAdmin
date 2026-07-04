@@ -25,7 +25,7 @@ const OTA_SERVICE_NAME: &str = "simadmin.service";
 const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf";
 const NM_UNMANAGED_WWAN_CONFIG: &str = "[keyfile]\nunmanaged-devices=interface-name:wwan*\n";
-const LATEST_RELEASE_API: &str = "https://api.github.com/repos/3899/SimAdmin/releases/latest";
+const LATEST_RELEASE_API: &str = "https://api.github.com/repos/Jane-Rui/SimAdmin/releases/latest";
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const UPDATE_CHECK_HOURS: [u32; 2] = [9, 18];
 const OTA_HTTP_TIMEOUT_SECS: u64 = 30;
@@ -146,11 +146,31 @@ pub fn is_supported_ota_asset(name: &str) -> bool {
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
 }
 
+/// 当前运行系统的 CPU 架构标识（用于从多架构 Release 中挑选匹配资产）
+/// 与 CI 发布时使用的命名约定一致：simadmin-<arch>.tar.gz，<arch> 取 Rust 的 ARCH 常量（x86_64 / aarch64）
+fn current_asset_arch_tag() -> &'static str {
+    std::env::consts::ARCH
+}
+
+/// 优先匹配当前架构的资产（文件名包含 -<arch>. 标记，如 simadmin-x86_64.tar.gz）；
+/// 找不到架构标记时（例如旧版单架构 Release）才退回到"任意受支持格式"的旧逻辑，
+/// 交由 validate_ota_package 的架构校验兜底拦截。
 pub fn supported_release_asset(release: &OtaLatestReleaseResponse) -> Option<&OtaReleaseAsset> {
+    let arch_tag = current_asset_arch_tag();
+    let arch_marker = format!("-{}.", arch_tag);
+
     release
         .assets
         .iter()
-        .find(|asset| is_supported_ota_asset(&asset.name))
+        .find(|asset| {
+            is_supported_ota_asset(&asset.name) && asset.name.contains(&arch_marker)
+        })
+        .or_else(|| {
+            release
+                .assets
+                .iter()
+                .find(|asset| is_supported_ota_asset(&asset.name))
+        })
 }
 
 pub async fn fetch_latest_github_release(
@@ -404,6 +424,11 @@ pub fn handle_ota_upload(data: &[u8]) -> Result<OtaUploadResponse, String> {
     Ok(OtaUploadResponse { meta, validation })
 }
 
+/// 当前运行系统的目标三元组（用于 OTA 架构校验，避免跨架构安装导致 Exec format error）
+fn current_target_triple() -> String {
+    format!("{}-unknown-linux-musl", std::env::consts::ARCH)
+}
+
 /// 验证 OTA 包
 fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
     let binary_path = format!("{}/simadmin", OTA_STAGING_DIR);
@@ -439,8 +464,9 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
     // 前端目录存在即可（MD5 跨平台难以保持一致）
     let frontend_md5_match = true; // 跳过前端 MD5 验证
 
-    // 检查架构（只接受 musl）
-    let arch_match = meta.arch == "aarch64-unknown-linux-musl";
+    // 检查架构：必须与当前运行系统架构一致（防止把 aarch64 包装到 x86_64 设备上，反之亦然）
+    let expected_arch = current_target_triple();
+    let arch_match = meta.arch == expected_arch;
 
     // 比较版本
     let is_newer = compare_versions(&meta.version, CURRENT_VERSION);
@@ -459,8 +485,8 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
         }
         if !arch_match {
             errors.push(format!(
-                "Arch mismatch: expected=aarch64-unknown-linux-musl, actual={}",
-                meta.arch
+                "Arch mismatch: expected={}, actual={}",
+                expected_arch, meta.arch
             ));
         }
         Some(errors.join("; "))
