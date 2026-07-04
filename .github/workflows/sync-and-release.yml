@@ -74,14 +74,22 @@ jobs:
           pnpm exec vite build
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
-      - uses: taiki-e/install-action@cross
+      - name: Build backend (x86_64-unknown-linux-musl，原生，无需交叉工具链)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          cd backend
+          cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: Build backend (x86_64-unknown-linux-musl)
-        run: cd backend && cross build --release --target x86_64-unknown-linux-musl
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-unknown-linux-musl
 
-      - name: Build backend (aarch64-unknown-linux-musl)
-        run: cd backend && cross build --release --target aarch64-unknown-linux-musl
+      - name: Build backend (aarch64-unknown-linux-musl，原生交叉编译，不走 cross/Docker)
+        run: cd backend && cargo build --release --target aarch64-unknown-linux-musl
 
       - name: Package release assets
         run: |
