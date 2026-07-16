@@ -252,7 +252,6 @@ pub async fn check_and_notify_version_update(
     Ok(())
 }
 
-
 pub async fn download_ota_asset_bytes(
     client: &reqwest::Client,
     proxy_prefix: &str,
@@ -312,7 +311,6 @@ pub async fn download_ota_asset_bytes(
         Err(last_error)
     }
 }
-
 
 /// 读取待安装的更新元数据
 fn read_pending_meta() -> Option<OtaMeta> {
@@ -520,7 +518,6 @@ fn normalize_version(version: &str) -> String {
 fn beijing_offset() -> FixedOffset {
     FixedOffset::east_opt(BEIJING_UTC_OFFSET_SECONDS).expect("valid Beijing UTC offset")
 }
-
 
 /// 应用 OTA 更新
 pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {

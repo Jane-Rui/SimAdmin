@@ -4230,7 +4230,10 @@ mod tests {
 
         sort_esim_profiles_for_display(&mut profiles);
 
-        let order: Vec<&str> = profiles.iter().map(|profile| profile.iccid.as_str()).collect();
+        let order: Vec<&str> = profiles
+            .iter()
+            .map(|profile| profile.iccid.as_str())
+            .collect();
         assert_eq!(order, vec!["200", "100", "300"]);
     }
 

@@ -349,6 +349,7 @@ export default function NotificationChannelsTab({
             {renderStringField(channel, 'to_user', 'ToUser')}
             {renderStringField(channel, 'to_party', 'ToParty')}
             {renderStringField(channel, 'to_tag', 'ToTag')}
+            {renderStringField(channel, 'api_base_url', 'API 反代地址')}
             {renderBoolField(channel, 'safe', '保密消息')}
           </Box>
         )

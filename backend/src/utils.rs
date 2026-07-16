@@ -368,13 +368,28 @@ nm-bridge\t0044A8C0\t00000000\t0001\t0\t0\t425\t00FFFFFF\t0\t0\t0";
     #[test]
     fn test_normalize_iccid() {
         // 19位 纯数字 -> 保持前19位不变
-        assert_eq!(normalize_iccid("8986000000000000001"), "8986000000000000001");
+        assert_eq!(
+            normalize_iccid("8986000000000000001"),
+            "8986000000000000001"
+        );
         // 20位 带尾部 F -> 去掉 F 并保留前19位
-        assert_eq!(normalize_iccid("8986000000000000001F"), "8986000000000000001");
-        assert_eq!(normalize_iccid("8986000000000000001f"), "8986000000000000001");
+        assert_eq!(
+            normalize_iccid("8986000000000000001F"),
+            "8986000000000000001"
+        );
+        assert_eq!(
+            normalize_iccid("8986000000000000001f"),
+            "8986000000000000001"
+        );
         // 正常的 20位数字 -> 截断并保留前19位
-        assert_eq!(normalize_iccid("89860000000000000018"), "8986000000000000001");
-        assert_eq!(normalize_iccid("89860000000000000010"), "8986000000000000001");
+        assert_eq!(
+            normalize_iccid("89860000000000000018"),
+            "8986000000000000001"
+        );
+        assert_eq!(
+            normalize_iccid("89860000000000000010"),
+            "8986000000000000001"
+        );
         // 空字符串 -> 保持空
         assert_eq!(normalize_iccid(""), "");
     }
@@ -1388,4 +1403,3 @@ pub fn normalize_iccid(iccid: &str) -> String {
     }
     cleaned
 }
-
