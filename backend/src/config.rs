@@ -115,6 +115,8 @@ pub struct PushPlusConfig {
 pub struct WecomAppConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
+    #[serde(default = "default_wecom_api_base_url")]
+    pub api_base_url: String,
     #[serde(default)]
     pub corp_id: String,
     #[serde(default)]
@@ -189,6 +191,8 @@ pub struct FeishuRobotConfig {
 pub struct TelegramConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
+    #[serde(default = "default_telegram_api_base_url")]
+    pub api_base_url: String,
     #[serde(default)]
     pub bot_token: String,
     #[serde(default)]
@@ -613,7 +617,7 @@ pub struct VersionUpdateNotificationConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SecurityConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub password_protection_enabled: bool,
     #[serde(default = "default_password_min_length")]
     pub password_min_length: u8,
@@ -743,6 +747,14 @@ fn default_wecom_to_user() -> String {
     "@all".to_string()
 }
 
+fn default_wecom_api_base_url() -> String {
+    "https://qyapi.weixin.qq.com".to_string()
+}
+
+fn default_telegram_api_base_url() -> String {
+    String::new()
+}
+
 fn default_dingtalk_msg_key() -> String {
     "sampleText".to_string()
 }
@@ -832,6 +844,7 @@ impl Default for WecomAppConfig {
     fn default() -> Self {
         Self {
             common: MessageChannelConfig::default(),
+            api_base_url: default_wecom_api_base_url(),
             corp_id: String::new(),
             agent_id: String::new(),
             secret: String::new(),
@@ -894,6 +907,7 @@ impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
             common: MessageChannelConfig::default(),
+            api_base_url: default_telegram_api_base_url(),
             bot_token: String::new(),
             chat_id: String::new(),
             parse_mode: String::new(),
@@ -1346,7 +1360,7 @@ impl Default for VersionUpdateNotificationConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            password_protection_enabled: true,
+            password_protection_enabled: false,
             password_min_length: default_password_min_length(),
             password_require_letters: true,
             password_require_digits: true,

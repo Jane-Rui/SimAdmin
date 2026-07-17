@@ -71,7 +71,7 @@ function ProtectedShell() {
 
   useEffect(() => {
     const idleTimeoutSeconds = authStatus?.settings?.idle_timeout_seconds ?? 0
-    const passwordProtectionEnabled = authStatus?.settings?.password_protection_enabled ?? true
+    const passwordProtectionEnabled = authStatus?.settings?.password_protection_enabled ?? false
     if (!allowed || !passwordProtectionEnabled || idleTimeoutSeconds <= 0) return undefined
 
     let timer: number | undefined

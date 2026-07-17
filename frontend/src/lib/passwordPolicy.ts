@@ -4,7 +4,7 @@ export type PasswordStrength = 'weak' | 'medium' | 'strong'
 
 export const PASSWORD_MAX_LENGTH = 64
 export const DEFAULT_SECURITY_SETTINGS: SecurityConfig = {
-  password_protection_enabled: true,
+  password_protection_enabled: false,
   password_min_length: 8,
   password_require_letters: true,
   password_require_digits: true,

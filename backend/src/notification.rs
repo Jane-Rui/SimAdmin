@@ -21,7 +21,7 @@ use lettre::message::{Mailbox, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use reqwest::{Client, StatusCode};
 use ring::hmac;
 use serde::de::DeserializeOwned;
@@ -35,6 +35,36 @@ use zbus::Connection;
 
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const NOTIFICATION_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+const QUERY_VALUE_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'!')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 /// Notification sender for all configured notification channels.
 pub struct NotificationSender {
@@ -42,7 +72,7 @@ pub struct NotificationSender {
     config_manager: Arc<ConfigManager>,
     dbus_conn: Arc<Connection>,
     database: Arc<Database>,
-    wecom_token_cache: tokio::sync::Mutex<HashMap<(String, String), WecomTokenCacheEntry>>,
+    wecom_token_cache: tokio::sync::Mutex<HashMap<(String, String, String), WecomTokenCacheEntry>>,
 }
 
 struct WecomTokenCacheEntry {
@@ -1639,20 +1669,24 @@ impl NotificationSender {
         config: &WecomAppConfig,
         payload: Value,
     ) -> Result<String, String> {
+        let api_base_url = wecom_api_base_url(config);
         let corp_id = config.corp_id.trim();
         let secret = config.secret.trim();
         let mut retried = false;
 
         loop {
-            let token = self.fetch_wecom_access_token(corp_id, secret).await?;
+            let token = self
+                .fetch_wecom_access_token(&api_base_url, corp_id, secret)
+                .await?;
             match self
-                .post_wecom_app_payload(token.as_str(), payload.clone())
+                .post_wecom_app_payload(&api_base_url, token.as_str(), payload.clone())
                 .await
             {
                 Ok(result) => return Ok(result),
                 Err(WecomMessageError::InvalidAccessToken(_)) if !retried => {
                     retried = true;
-                    self.invalidate_wecom_access_token(corp_id, secret).await;
+                    self.invalidate_wecom_access_token(&api_base_url, corp_id, secret)
+                        .await;
                     continue;
                 }
                 Err(WecomMessageError::InvalidAccessToken(err)) => return Err(err),
@@ -1663,12 +1697,14 @@ impl NotificationSender {
 
     async fn post_wecom_app_payload(
         &self,
+        api_base_url: &str,
         access_token: &str,
         payload: Value,
     ) -> Result<String, WecomMessageError> {
         let url = format!(
-            "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={}",
-            access_token
+            "{}/cgi-bin/message/send?access_token={}",
+            api_base_url,
+            encode_query_value(access_token)
         );
         let response = self
             .client
@@ -1693,10 +1729,15 @@ impl NotificationSender {
 
     async fn fetch_wecom_access_token(
         &self,
+        api_base_url: &str,
         corp_id: &str,
         secret: &str,
     ) -> Result<String, String> {
-        let cache_key = (corp_id.to_string(), secret.to_string());
+        let cache_key = (
+            api_base_url.to_string(),
+            corp_id.to_string(),
+            secret.to_string(),
+        );
         let mut cache = self.wecom_token_cache.lock().await;
         if let Some(entry) = cache.get(&cache_key) {
             if Instant::now() < entry.refresh_at {
@@ -1704,7 +1745,9 @@ impl NotificationSender {
             }
         }
 
-        let parsed = self.request_wecom_access_token(corp_id, secret).await?;
+        let parsed = self
+            .request_wecom_access_token(api_base_url, corp_id, secret)
+            .await?;
         let expires_in = parsed.expires_in.unwrap_or(7200).max(1);
         let refresh_after = if expires_in > 600 {
             expires_in - 300
@@ -1723,13 +1766,18 @@ impl NotificationSender {
         Ok(token)
     }
 
-    async fn invalidate_wecom_access_token(&self, corp_id: &str, secret: &str) {
+    async fn invalidate_wecom_access_token(&self, api_base_url: &str, corp_id: &str, secret: &str) {
         let mut cache = self.wecom_token_cache.lock().await;
-        cache.remove(&(corp_id.to_string(), secret.to_string()));
+        cache.remove(&(
+            api_base_url.to_string(),
+            corp_id.to_string(),
+            secret.to_string(),
+        ));
     }
 
     async fn request_wecom_access_token(
         &self,
+        api_base_url: &str,
         corp_id: &str,
         secret: &str,
     ) -> Result<WecomTokenResponse, String> {
@@ -1746,7 +1794,8 @@ impl NotificationSender {
         }
 
         let url = format!(
-            "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={}&corpsecret={}",
+            "{}/cgi-bin/gettoken?corpid={}&corpsecret={}",
+            api_base_url,
             encode_query_value(corp_id),
             encode_query_value(secret)
         );
@@ -1764,9 +1813,10 @@ impl NotificationSender {
         let parsed: RawWecomTokenResponse = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse WeCom token response: {}", e))?;
         if parsed.errcode != 0 {
-            return Err(format!(
-                "WeCom token error {}: {}",
-                parsed.errcode, parsed.errmsg
+            return Err(format_wecom_errcode(
+                "WeCom token",
+                parsed.errcode,
+                &parsed.errmsg,
             ));
         }
         if parsed.access_token.is_empty() {
@@ -2262,10 +2312,7 @@ impl NotificationSender {
         if config.bot_token.trim().is_empty() || config.chat_id.trim().is_empty() {
             return Err("Telegram Bot Token 或 Chat ID 未配置".to_string());
         }
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            config.bot_token.trim()
-        );
+        let url = telegram_send_message_url(config);
         let mut payload = Map::new();
         payload.insert("chat_id".to_string(), json!(config.chat_id.trim()));
         payload.insert("text".to_string(), json!(text));
@@ -3184,7 +3231,7 @@ fn insert_non_empty(payload: &mut Map<String, Value>, key: &str, value: &str) {
 }
 
 fn encode_query_value(value: &str) -> String {
-    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+    utf8_percent_encode(value, QUERY_VALUE_ENCODE_SET).to_string()
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -3217,6 +3264,49 @@ fn is_wecom_access_token_error(body: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn wecom_api_base_url(config: &WecomAppConfig) -> String {
+    let configured = config.api_base_url.trim();
+    let base = if configured.is_empty() {
+        "https://qyapi.weixin.qq.com"
+    } else {
+        configured
+    };
+    base.trim_end_matches('/').to_string()
+}
+
+fn telegram_api_base_url(config: &TelegramConfig) -> String {
+    let configured = config.api_base_url.trim();
+    let base = if configured.is_empty() {
+        "https://api.telegram.org"
+    } else {
+        configured
+    };
+    base.trim_end_matches('/').to_string()
+}
+
+fn telegram_send_message_url(config: &TelegramConfig) -> String {
+    format!(
+        "{}/bot{}/sendMessage",
+        telegram_api_base_url(config),
+        config.bot_token.trim()
+    )
+}
+
+fn format_channel_errcode(label: &str, errcode: i64, message: &str) -> String {
+    if errcode == 60020 {
+        return format!(
+            "{} returned errcode 60020: {}. 企业微信应用请求出口 IP 未加入企业可信 IP，请在企业微信后台添加当前出口 IP，或将 API 地址设置为固定公网 IP 的企业微信中继/反代地址。",
+            label, message
+        );
+    }
+
+    format!("{} returned errcode {}: {}", label, errcode, message)
+}
+
+fn format_wecom_errcode(label: &str, errcode: i64, message: &str) -> String {
+    format_channel_errcode(label, errcode, message)
+}
+
 fn json_errcode(body: &str) -> Option<(i64, String)> {
     let value = serde_json::from_str::<Value>(body).ok()?;
     let errcode = value.get("errcode").and_then(Value::as_i64)?;
@@ -3247,10 +3337,7 @@ fn response_result(label: &str, status: StatusCode, body: String) -> Result<Stri
                     .or_else(|| value.get("err_msg"))
                     .and_then(Value::as_str)
                     .unwrap_or(&body);
-                return Err(format!(
-                    "{} returned errcode {}: {}",
-                    label, errcode, message
-                ));
+                return Err(format_channel_errcode(label, errcode, message));
             }
         }
         if let Some(code) = value.get("code").and_then(Value::as_i64) {
@@ -3975,5 +4062,54 @@ mod tests {
         assert!(!is_wecom_access_token_error(
             r#"{"errcode":0,"errmsg":"ok"}"#
         ));
+    }
+
+    #[test]
+    fn normalizes_wecom_api_base_url() {
+        let mut config = WecomAppConfig::default();
+        assert_eq!(wecom_api_base_url(&config), "https://qyapi.weixin.qq.com");
+
+        config.api_base_url = " https://relay.example.com/wecom/ ".to_string();
+        assert_eq!(wecom_api_base_url(&config), "https://relay.example.com/wecom");
+
+        config.api_base_url = " ".to_string();
+        assert_eq!(wecom_api_base_url(&config), "https://qyapi.weixin.qq.com");
+    }
+
+    #[test]
+    fn builds_telegram_send_message_url_from_api_base_url() {
+        let mut config = TelegramConfig::default();
+        config.bot_token = "123456:abcdef".to_string();
+        assert_eq!(
+            telegram_send_message_url(&config),
+            "https://api.telegram.org/bot123456:abcdef/sendMessage"
+        );
+
+        config.api_base_url = " https://relay.example.com/telegram/ ".to_string();
+        assert_eq!(
+            telegram_send_message_url(&config),
+            "https://relay.example.com/telegram/bot123456:abcdef/sendMessage"
+        );
+
+        config.api_base_url = " ".to_string();
+        assert_eq!(telegram_api_base_url(&config), "https://api.telegram.org");
+    }
+
+    #[test]
+    fn query_value_encoding_preserves_unreserved_token_chars() {
+        assert_eq!(
+            encode_query_value("abc-DEF_123.~"),
+            "abc-DEF_123.~"
+        );
+        assert_eq!(encode_query_value("a+b/c=d&x y"), "a%2Bb%2Fc%3Dd%26x%20y");
+    }
+
+    #[test]
+    fn formats_wecom_trusted_ip_error() {
+        let error = format_channel_errcode("WeCom token", 60020, "not allow to access from your ip");
+
+        assert!(error.contains("60020"));
+        assert!(error.contains("企业可信 IP"));
+        assert!(error.contains("中继/反代"));
     }
 }

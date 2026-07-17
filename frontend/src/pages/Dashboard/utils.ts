@@ -69,3 +69,45 @@ export const getSensitiveStyle = (show: boolean) => ({
   transition: 'filter 0.3s ease',
   userSelect: show ? 'auto' as const : 'none' as const,
 })
+
+export const TEMPERATURE_DANGER_THRESHOLD = 100
+
+export const getTempPercent = (temp: number) => {
+  return Math.min(Math.max((temp / TEMPERATURE_DANGER_THRESHOLD) * 100, 0), 100)
+}
+
+export const getTempBarColor = (currentTemp: number) => {
+  const clampedTemp = Math.max(0, currentTemp)
+  const steppedTemp = Math.round(clampedTemp / 5) * 5
+
+  let hue: number
+
+  if (steppedTemp <= 50) {
+    const ratio = steppedTemp / 50
+    hue = Math.round(193 - (193 - 45) * ratio)
+  } else if (steppedTemp <= 100) {
+    const ratio = (steppedTemp - 50) / 50
+    hue = Math.round(45 - 45 * ratio)
+  } else {
+    hue = 0
+  }
+
+  return `hsl(${hue}, 84%, 60%)`
+}
+
+export const generateHeatmapGradient = () => {
+  const stops = []
+
+  for (let percent = 0; percent <= 100; percent += 5) {
+    let hue: number
+    if (percent <= 50) {
+      hue = Math.round(193 - (193 - 45) * (percent / 50))
+    } else {
+      hue = Math.round(45 - 45 * ((percent - 50) / 50))
+    }
+    stops.push(`hsl(${hue}, 84%, 60%) ${percent}%`)
+  }
+
+  return `linear-gradient(to right, ${stops.join(', ')})`
+}
+

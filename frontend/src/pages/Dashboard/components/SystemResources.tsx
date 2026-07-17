@@ -1,7 +1,7 @@
-﻿import { Box, Card, CardContent, LinearProgress, SvgIcon, Typography, useTheme, type Theme } from '@mui/material'
+import { Box, Card, CardContent, LinearProgress, SvgIcon, Typography, useTheme, type Theme } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import { Memory, Speed as CpuIcon, Storage, Thermostat } from '@mui/icons-material'
-import { formatBytes, getCpuColor, getMemoryColor } from '../utils'
+import { formatBytes, getCpuColor, getMemoryColor, getTempPercent, getTempBarColor, generateHeatmapGradient } from '../utils'
 import type { SystemStatsResponse, ThermalZone } from '@/api/types'
 
 interface SystemResourcesProps {
@@ -43,8 +43,6 @@ function CpuChipIcon() {
   )
 }
 
-const TEMPERATURE_DANGER_THRESHOLD = 100
-
 function resourceGradient(start: string, end: string) {
   return {
     '& .MuiLinearProgress-bar': {
@@ -52,45 +50,6 @@ function resourceGradient(start: string, end: string) {
       borderRadius: 999,
     },
   }
-}
-
-function getTempPercent(temp: number) {
-  return Math.min(Math.max((temp / TEMPERATURE_DANGER_THRESHOLD) * 100, 0), 100)
-}
-
-function getTempBarColor(currentTemp: number) {
-  const clampedTemp = Math.max(0, currentTemp)
-  const steppedTemp = Math.round(clampedTemp / 5) * 5
-
-  let hue: number
-
-  if (steppedTemp <= 50) {
-    const ratio = steppedTemp / 50
-    hue = Math.round(193 - (193 - 45) * ratio)
-  } else if (steppedTemp <= 100) {
-    const ratio = (steppedTemp - 50) / 50
-    hue = Math.round(45 - 45 * ratio)
-  } else {
-    hue = 0
-  }
-
-  return `hsl(${hue}, 84%, 60%)`
-}
-
-function generateHeatmapGradient() {
-  const stops = []
-
-  for (let percent = 0; percent <= 100; percent += 5) {
-    let hue: number
-    if (percent <= 50) {
-      hue = Math.round(193 - (193 - 45) * (percent / 50))
-    } else {
-      hue = Math.round(45 - 45 * ((percent - 50) / 50))
-    }
-    stops.push(`hsl(${hue}, 84%, 60%) ${percent}%`)
-  }
-
-  return `linear-gradient(to right, ${stops.join(', ')})`
 }
 
 function getTempDotColor(sensor: ThermalZone | null) {

@@ -6,7 +6,7 @@
   <br/>
 
   <div>
-    <a href="https://github.com/3899/SimAdmin/releases">
+    <a href="https://github.com/3899/">
       <img 
         alt="Debian"
         src="https://img.shields.io/badge/Debian-%23D70A53?logo=debian&logoColor=white&style=flat-square" 
@@ -190,28 +190,24 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 
 ### 👥 贡献者
 
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/crossgg">
-        <img src="https://avatars.githubusercontent.com/u/37495419?v=4" width="64" style="border-radius:50%;"/><br>
-        <sub>crossgg</sub>
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/enjin1314">
-        <img src="https://avatars.githubusercontent.com/u/64971822?v=4" width="64" style="border-radius:50%;"/><br>
-        <sub>enjin1314</sub>
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/nkguo">
-        <img src="https://avatars.githubusercontent.com/u/217694652?v=4" width="64" style="border-radius:50%;"/><br>
-        <sub>nkguo</sub>
-      </a>
-    </td>
-  </tr>
-</table>
+#### 💻 代码贡献者
+
+<a href="https://github.com/3899/SimAdmin/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=3899/SimAdmin" alt="Contributors" />
+</a>
+<a href="https://github.com/nkguo" title="nkguo">
+  <img src="https://wsrv.nl/?url=https://github.com/nkguo.png&w=64&h=64&fit=cover&mask=circle" alt="nkguo" />
+</a>
+
+#### 💖 特别贡献者
+
+<a href="https://github.com/crossgg" title="crossgg">
+  <img src="https://wsrv.nl/?url=https://github.com/crossgg.png&w=64&h=64&fit=cover&mask=circle" alt="crossgg" />
+</a>
+<a href="https://github.com/enjin1314" title="enjin1314">
+  <img src="https://wsrv.nl/?url=https://github.com/enjin1314.png&w=64&h=64&fit=cover&mask=circle" alt="enjin1314" />
+</a>
+
 
 ### 📦 参考项目
 

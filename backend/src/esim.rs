@@ -23,6 +23,7 @@ use crate::models::{
 
 const ESIM_SHORT_TIMEOUT_SECS: u64 = 20;
 const ESIM_LONG_TIMEOUT_SECS: u64 = 60;
+const ESIM_SWITCH_PREFLIGHT_TIMEOUT_SECS: u64 = 5;
 const LPAC_REPAIR_TIMEOUT_SECS: u64 = 120;
 const LPAC_PROBE_TIMEOUT_SECS: u64 = 3;
 const MAX_LPAC_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
@@ -248,10 +249,33 @@ impl EsimSupervisor {
         Ok(normalize_profiles(response))
     }
 
+    pub async fn get_profiles_for_switch(&self) -> Result<EsimProfilesResponse, EsimApiError> {
+        let response = self
+            .call_lpac(
+                "profiles",
+                &["profile", "list"],
+                ESIM_SWITCH_PREFLIGHT_TIMEOUT_SECS,
+            )
+            .await?;
+        if !command_succeeded(&response) {
+            return Err(EsimApiError::Command(response.msg));
+        }
+        Ok(normalize_profiles(response))
+    }
+
     pub async fn enable_profile(&self, iccid: String) -> Result<EsimCommandResponse, EsimApiError> {
+        self.enable_profile_with_refresh_flag(iccid, true).await
+    }
+
+    pub async fn enable_profile_with_refresh_flag(
+        &self,
+        iccid: String,
+        refresh: bool,
+    ) -> Result<EsimCommandResponse, EsimApiError> {
+        let refresh_flag = if refresh { "1" } else { "0" };
         self.call_lpac(
             "enable",
-            &["profile", "enable", iccid.as_str(), "1"],
+            &["profile", "enable", iccid.as_str(), refresh_flag],
             ESIM_LONG_TIMEOUT_SECS,
         )
         .await

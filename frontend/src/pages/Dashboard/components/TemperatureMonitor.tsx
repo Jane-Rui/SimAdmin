@@ -1,19 +1,10 @@
 import { Box, Card, CardContent, Typography, useTheme, type Theme } from '@mui/material'
 import { LocalFireDepartment } from '@mui/icons-material'
 import type { SystemStatsResponse } from '@/api/types'
+import { getTempPercent, getTempBarColor } from '../utils'
 
 interface TemperatureMonitorProps {
   systemStats: SystemStatsResponse | null
-}
-
-function getTempPercent(temp: number) {
-  return Math.min(Math.max(temp, 0), 100)
-}
-
-function getTempBarColor(percent: number) {
-  const steppedPercent = Math.round(percent / 5) * 5
-  const hue = 150 - steppedPercent * 2
-  return `hsl(${hue}, 82%, 48%)`
 }
 
 export function TemperatureMonitor({ systemStats }: TemperatureMonitorProps) {
@@ -31,7 +22,7 @@ export function TemperatureMonitor({ systemStats }: TemperatureMonitorProps) {
           <Box display="flex" flexDirection="column" gap={1.5}>
             {systemStats.temperature.map((sensor, idx) => {
               const percent = getTempPercent(sensor.temperature)
-              const color = getTempBarColor(percent)
+              const color = getTempBarColor(sensor.temperature)
               return (
                 <Box key={`${sensor.type}-${idx}`} display="flex" alignItems="center" justifyContent="space-between" gap={1.5}>
                   <Typography

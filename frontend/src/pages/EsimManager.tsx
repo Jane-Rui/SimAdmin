@@ -946,22 +946,32 @@ export default function EsimManagerPage() {
   }
 
   const startBasebandRecoveryPolling = () => {
+    if (basebandRecoveryTimerRef.current !== undefined) {
+      window.clearInterval(basebandRecoveryTimerRef.current)
+      basebandRecoveryTimerRef.current = undefined
+    }
     setBasebandRecoveryOpen(true)
     setBasebandRecoveryRunning(true)
     setBasebandRecoverySteps([])
     setBasebandRecoveryRegistration(null)
 
+    const handleStatusResult = (finished: boolean) => {
+      if (finished) {
+        if (basebandRecoveryTimerRef.current !== undefined) {
+          window.clearInterval(basebandRecoveryTimerRef.current)
+          basebandRecoveryTimerRef.current = undefined
+        }
+        setBasebandRecoveryRunning(false)
+        void loadData(true)
+      }
+    }
+
     // Poll every 1s until baseband recovery finishes
     const timer = window.setInterval(() => {
-      void loadBasebandRecoveryStatus().then((finished) => {
-        if (finished) {
-          window.clearInterval(timer)
-          setBasebandRecoveryRunning(false)
-          void loadData(true)
-        }
-      })
+      void loadBasebandRecoveryStatus().then(handleStatusResult)
     }, 1000)
     basebandRecoveryTimerRef.current = timer
+    void loadBasebandRecoveryStatus().then(handleStatusResult)
   }
 
   // Cleanup polling timer on unmount

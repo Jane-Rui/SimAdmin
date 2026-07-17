@@ -644,6 +644,7 @@ export interface PushPlusConfig extends MessageChannelConfig {
 }
 
 export interface WecomAppConfig extends MessageChannelConfig {
+  api_base_url: string
   corp_id: string
   agent_id: string
   secret: string
@@ -681,6 +682,7 @@ export interface FeishuRobotConfig extends MessageChannelConfig {
 }
 
 export interface TelegramConfig extends MessageChannelConfig {
+  api_base_url: string
   bot_token: string
   chat_id: string
   parse_mode: string

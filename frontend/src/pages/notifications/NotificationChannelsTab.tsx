@@ -1,4 +1,4 @@
-import { useState, type ChangeEvent, type MouseEvent } from 'react'
+import { useState, type ChangeEvent, type MouseEvent, type ReactNode } from 'react'
 import {
   Avatar,
   Box,
@@ -9,6 +9,7 @@ import {
   Divider,
   FormControlLabel,
   IconButton,
+  InputAdornment,
   List,
   ListItemButton,
   ListItemText,
@@ -22,7 +23,7 @@ import {
   useMediaQuery,
 } from '@mui/material'
 import { alpha, type Theme } from '@mui/material/styles'
-import { Add, DeleteOutline, PlayArrow, Save } from '@mui/icons-material'
+import { Add, DeleteOutline, HelpOutline, PlayArrow, Save } from '@mui/icons-material'
 import type { NotificationChannelInstance, NotificationChannelKey, NotificationConfig } from '../../api/current'
 import {
   CHANNEL_DEFS,
@@ -61,6 +62,82 @@ const channelTextFieldSx = {
     fontSize: '14px',
   },
 } as const
+
+type ApiBaseUrlHelpKind = 'wecom_app' | 'telegram'
+
+const apiBaseUrlHelpContent = (kind: ApiBaseUrlHelpKind) => {
+  const isTelegram = kind === 'telegram'
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, py: 0.5 }}>
+      <Typography variant="subtitle2" fontWeight={600} color="text.primary" sx={{ fontSize: '14px', display: 'flex', alignItems: 'center', gap: 0.5 }}>
+        API 反代地址配置
+      </Typography>
+
+      <Typography variant="body2" color="text.secondary" sx={{ fontSize: '13px', lineHeight: 1.5 }}>
+        当服务器无法直接连接官方 API 时，可在此填写代理服务地址。<strong>留空表示直连官方 API。</strong>
+      </Typography>
+
+      <Box sx={{ bgcolor: (theme) => theme.palette.mode === 'light' ? 'rgba(0, 0, 0, 0.02)' : 'rgba(255, 255, 255, 0.02)', p: 1.25, borderRadius: 1, border: (theme) => `1px dashed ${theme.palette.divider}` }}>
+        <Typography variant="caption" display="block" color="text.secondary" sx={{ fontWeight: 600, mb: 0.5 }}>
+          填写规范：
+        </Typography>
+        <Typography variant="caption" display="block" color="text.secondary" component="ul" sx={{ pl: 2, m: 0, '& li': { mb: 0.25 } }}>
+          <li>必须包含 <code>http://</code> 或 <code>https://</code> 协议头</li>
+          <li>可携带自定义端口及路径前缀（如 <code>/tg</code>）</li>
+          <li>不要填写具体的 API 接口动作路径</li>
+        </Typography>
+      </Box>
+
+      <Box sx={{ width: '100%' }}>
+        <Typography variant="caption" display="block" color="text.secondary" sx={{ fontWeight: 600, mb: 0.5 }}>
+          填写示例：
+        </Typography>
+        <Box sx={{
+          fontFamily: 'Consolas, Monaco, monospace',
+          fontSize: '11px',
+          bgcolor: (theme) => theme.palette.mode === 'light' ? '#f1f5f9' : '#1e293b',
+          color: (theme) => theme.palette.mode === 'light' ? '#0f172a' : '#cbd5e1',
+          p: 1.25,
+          borderRadius: 1,
+          border: (theme) => `1px solid ${theme.palette.divider}`,
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-all'
+        }}>
+          {isTelegram
+            ? 'https://relay.example.com/telegram\nhttp://192.168.1.10:8080/tg'
+            : 'https://relay.example.com/wecom\nhttp://192.168.1.10:8080/wecom'}
+        </Box>
+      </Box>
+
+      <Box>
+        <Typography variant="caption" display="block" color="text.secondary" sx={{ fontWeight: 600, mb: 0.5 }}>
+          实际请求路径：
+        </Typography>
+        <Box sx={{
+          fontSize: '11px',
+          color: 'primary.main',
+          bgcolor: (theme) => theme.palette.mode === 'light' ? 'rgba(18, 150, 219, 0.06)' : 'rgba(66, 183, 245, 0.08)',
+          p: 1,
+          borderRadius: 1,
+          border: (theme) => `1px solid ${theme.palette.mode === 'light' ? 'rgba(18, 150, 219, 0.2)' : 'rgba(66, 183, 245, 0.2)'}`,
+          fontFamily: 'Consolas, Monaco, monospace',
+          wordBreak: 'break-all',
+          lineHeight: 1.4
+        }}>
+          {isTelegram ? (
+            <>
+              [反代地址]<strong>/bot&lt;TOKEN&gt;/sendMessage</strong>
+            </>
+          ) : (
+            <>
+              [反代地址]<strong>/cgi-bin/gettoken</strong> 等
+            </>
+          )}
+        </Box>
+      </Box>
+    </Box>
+  )
+}
 
 type NotificationChannelsTabProps = {
   config: NotificationConfig
@@ -114,7 +191,7 @@ export default function NotificationChannelsTab({
     channel: NotificationChannelInstance,
     key: string,
     label: string,
-    extra?: { password?: boolean; select?: string[]; multiline?: boolean },
+    extra?: { password?: boolean; select?: string[]; multiline?: boolean; endAdornment?: ReactNode },
   ) => (
     <TextField
       key={key}
@@ -127,11 +204,53 @@ export default function NotificationChannelsTab({
       minRows={extra?.multiline ? 3 : undefined}
       fullWidth
       sx={channelTextFieldSx}
+      slotProps={extra?.endAdornment ? {
+        input: {
+          endAdornment: extra.endAdornment,
+        },
+      } : undefined}
     >
       {extra?.select?.map((option) => (
         <MenuItem key={option} value={option}>{option || '默认'}</MenuItem>
       ))}
     </TextField>
+  )
+
+  const renderApiBaseUrlHelp = (kind: ApiBaseUrlHelpKind) => (
+    <InputAdornment position="end">
+      <Tooltip
+        title={apiBaseUrlHelpContent(kind)}
+        arrow
+        placement="top"
+        slotProps={{
+          tooltip: {
+            sx: {
+              bgcolor: (theme) => theme.palette.mode === 'light' ? '#ffffff' : '#0f172a',
+              color: 'text.primary',
+              boxShadow: (theme) => theme.palette.mode === 'light'
+                ? '0 10px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.05), 0 0 0 1px rgba(0,0,0,0.05)'
+                : '0 10px 25px -5px rgba(0,0,0,0.5), 0 8px 10px -6px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.08)',
+              borderRadius: 2,
+              p: 2.25,
+              border: (theme) => `1px solid ${theme.palette.divider}`,
+              maxWidth: 380,
+            },
+          },
+          arrow: {
+            sx: {
+              color: (theme) => theme.palette.mode === 'light' ? '#ffffff' : '#0f172a',
+              '&::before': {
+                border: (theme) => `1px solid ${theme.palette.divider}`,
+              },
+            },
+          },
+        }}
+      >
+        <IconButton size="small" edge="end" aria-label="API 反代地址填写说明">
+          <HelpOutline fontSize="small" />
+        </IconButton>
+      </Tooltip>
+    </InputAdornment>
   )
 
   const renderBoolField = (channel: NotificationChannelInstance, key: string, label: string) => (
@@ -349,6 +468,7 @@ export default function NotificationChannelsTab({
             {renderStringField(channel, 'to_user', 'ToUser')}
             {renderStringField(channel, 'to_party', 'ToParty')}
             {renderStringField(channel, 'to_tag', 'ToTag')}
+            {renderStringField(channel, 'api_base_url', 'API 反代地址', { endAdornment: renderApiBaseUrlHelp('wecom_app') })}
             {renderBoolField(channel, 'safe', '保密消息')}
           </Box>
         )
@@ -393,6 +513,7 @@ export default function NotificationChannelsTab({
             {renderStringField(channel, 'bot_token', 'Bot Token', { password: true })}
             {renderStringField(channel, 'chat_id', 'Chat ID')}
             {renderStringField(channel, 'parse_mode', 'Parse Mode', { select: ['', 'MarkdownV2', 'HTML'] })}
+            {renderStringField(channel, 'api_base_url', 'API 反代地址', { endAdornment: renderApiBaseUrlHelp('telegram') })}
             {renderBoolField(channel, 'disable_web_page_preview', '禁用链接预览')}
           </Box>
         )
