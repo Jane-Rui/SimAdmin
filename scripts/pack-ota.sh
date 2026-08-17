@@ -1,12 +1,42 @@
 #!/bin/bash
 
 # 打包 OTA 更新包
-# 输出: release/simadmin_{version}.tar.gz
+# 输出: release/simadmin_{version}_{target}.tar.gz
 
 set -e
 
 # 切换到项目根目录
 cd "$(dirname "$0")/.."
+
+TARGET="${TARGET:-aarch64-unknown-linux-musl}"
+for arg in "$@"; do
+    case "$arg" in
+        --target=aarch64|--target=arm64|--target=aarch64-unknown-linux-musl)
+            TARGET="aarch64-unknown-linux-musl"
+            ;;
+        --target=x86_64|--target=amd64|--target=x86_64-unknown-linux-musl)
+            TARGET="x86_64-unknown-linux-musl"
+            ;;
+        --help|-h)
+            echo "用法: ./scripts/pack-ota.sh [--target=aarch64|x86_64]"
+            exit 0
+            ;;
+        *)
+            echo "❌ 错误: 未知选项: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
+
+case "$TARGET" in
+    aarch64|arm64) TARGET="aarch64-unknown-linux-musl" ;;
+    x86_64|amd64) TARGET="x86_64-unknown-linux-musl" ;;
+    aarch64-unknown-linux-musl|x86_64-unknown-linux-musl) ;;
+    *)
+        echo "❌ 错误: 不支持的构建目标: $TARGET" >&2
+        exit 1
+        ;;
+esac
 
 echo "=========================================="
 echo "  打包 OTA 更新包"
@@ -33,10 +63,10 @@ fi
 BUILD_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%dT%H:%M:%S+08:00")
 
 # 目标架构
-ARCH="aarch64-unknown-linux-musl"
+ARCH="$TARGET"
 
 # 检查构建产物
-BINARY_PATH="backend/target/aarch64-unknown-linux-musl/release/simadmin"
+BINARY_PATH="backend/target/$TARGET/release/simadmin"
 FRONTEND_DIR="frontend/dist"
 
 if [ ! -f "$BINARY_PATH" ]; then
@@ -89,9 +119,16 @@ else
     FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
 fi
 echo "   MD5: $FRONTEND_MD5"
+EDITION="${EDITION:-${VARIANT:-standard}}"
+for arg in "$@"; do
+    case "$arg" in
+        --wfc|wfc) EDITION="wfc" ;;
+        --edition=*|--variant=*) EDITION="${arg#*=}" ;;
+    esac
+done
 
 # 生成 meta.json
-echo "📋 生成 meta.json..."
+echo "📋 生成 meta.json ( edition: $EDITION)..."
 cat > "$OTA_TMP/meta.json" << EOF
 {
     "version": "$VERSION",
@@ -99,7 +136,8 @@ cat > "$OTA_TMP/meta.json" << EOF
     "build_time": "$BUILD_TIME",
     "binary_md5": "$BINARY_MD5",
     "frontend_md5": "$FRONTEND_MD5",
-    "arch": "$ARCH"
+    "arch": "$ARCH",
+    "edition": "$EDITION"
 }
 EOF
 
@@ -110,7 +148,7 @@ echo ""
 mkdir -p release
 
 # 打包
-OTA_FILE="release/simadmin_${VERSION}.tar.gz"
+OTA_FILE="release/simadmin_${VERSION}_${TARGET}.tar.gz"
 echo "📦 打包 OTA 更新包..."
 cd "$OTA_TMP"
 tar -czf - meta.json simadmin www > "$OLDPWD/$OTA_FILE"

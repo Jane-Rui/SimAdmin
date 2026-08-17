@@ -576,6 +576,7 @@ export interface ConnectivityCheckResponse {
 export interface WebhookConfig {
   enabled: boolean
   url: string
+  http_method: string
   forward_sms: boolean
   forward_calls: boolean
   forward_ddns: boolean
@@ -766,6 +767,7 @@ export interface NotificationRule {
   event_codes: string[]
   title_template: string
   template: string
+  custom_body: string
   quiet_hours: QuietHoursSchedule[]
   ddns_failure_threshold: number
   device_status_items: string[]
@@ -892,6 +894,7 @@ export interface OtaMeta {
   frontend_md5: string
   arch: string
   min_version?: string
+  edition?: string
 }
 
 export interface OtaValidation {
@@ -906,6 +909,12 @@ export interface OtaValidation {
 export interface OtaStatusResponse {
   current_version: string
   current_commit: string
+  current_build_time?: string
+  current_binary_md5?: string
+  current_frontend_md5?: string
+  current_arch?: string
+  current_edition?: string
+  installed_meta?: OtaMeta
   pending_update: boolean
   pending_meta?: OtaMeta
 }

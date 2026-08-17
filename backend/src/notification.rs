@@ -292,6 +292,31 @@ impl NotificationEvent<'_> {
         }
     }
 
+    /// Render a JSON template with all variable values properly JSON-escaped.
+    /// Used for custom_body rendering where the output must be valid JSON.
+    fn render_json_safe(&self, template: &str) -> String {
+        match self {
+            NotificationEvent::Sms { message, context } => {
+                render_sms_template(template, message, context, true)
+            }
+            NotificationEvent::Ddns(event, context) => {
+                render_ddns_template(template, event, context, true)
+            }
+            NotificationEvent::VersionUpdate(event, context) => {
+                render_version_update_template(template, event, context, true)
+            }
+            NotificationEvent::SystemEvent(event, context) => {
+                render_system_event_template(template, event, context, true)
+            }
+            NotificationEvent::DeviceStatus(report, context) => {
+                render_device_status_template(template, report, context, true)
+            }
+            NotificationEvent::Automation(event, context) => {
+                render_automation_template(template, event, context, true)
+            }
+        }
+    }
+
     fn render_title(&self, title_template: &str) -> String {
         let use_default = title_template.trim().is_empty();
         let default_template = crate::config::default_rule_title_template(self.event_type());
@@ -580,6 +605,12 @@ impl NotificationSender {
             }
 
             let text = event.render(&rule.template);
+            let use_custom_body = !rule.custom_body.trim().is_empty();
+            let custom_body_rendered = if use_custom_body {
+                event.render_json_safe(&rule.custom_body)
+            } else {
+                String::new()
+            };
             let log_summary = match event.event_type() {
                 NotificationEventType::SystemEvent | NotificationEventType::DeviceStatus => {
                     text.as_str()
@@ -640,14 +671,21 @@ impl NotificationSender {
                 }
 
                 let title = event.render_title(&rule.title_template);
+                // Branch: custom_body mode vs plain text mode
+                let send_body = if use_custom_body {
+                    &custom_body_rendered
+                } else {
+                    &text
+                };
                 match self
                     .send_text_to_channel_with_queue(
                         event,
                         rule,
                         channel,
                         &title,
-                        &text,
+                        send_body,
                         log_summary,
+                        use_custom_body,
                     )
                     .await
                 {
@@ -812,6 +850,7 @@ impl NotificationSender {
         title: &str,
         text: &str,
         summary: &str,
+        use_custom_body: bool,
     ) -> Result<ChannelDeliveryResult, String> {
         if let Some(reason) = self.rate_limit_reason(channel)? {
             let next_attempt_at =
@@ -830,7 +869,12 @@ impl NotificationSender {
             return Ok(ChannelDeliveryResult::Queued(reason));
         }
 
-        match self.send_text_to_channel(channel, title, text).await {
+        let send_result = if use_custom_body {
+            self.send_custom_body_to_channel(channel, text).await
+        } else {
+            self.send_text_to_channel(channel, title, text).await
+        };
+        match send_result {
             Ok(message) => Ok(ChannelDeliveryResult::Sent(message)),
             Err(err) => {
                 let next_attempt_at = beijing_time_after_seconds(60);
@@ -971,10 +1015,19 @@ impl NotificationSender {
             return;
         }
 
-        match self
-            .send_text_to_channel(channel, &item.title, &item.body)
-            .await
-        {
+        // Auto-detect custom body: if stored body is valid JSON object/array, use custom body path
+        let is_custom_body = {
+            let trimmed = item.body.trim();
+            (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && serde_json::from_str::<Value>(trimmed).is_ok()
+        };
+        let send_result = if is_custom_body {
+            self.send_custom_body_to_channel(channel, &item.body).await
+        } else {
+            self.send_text_to_channel(channel, &item.title, &item.body)
+                .await
+        };
+        match send_result {
             Ok(message) => {
                 if let Err(err) = self.database.mark_notification_queue_sent(item.id) {
                     warn!(error = %err, id = item.id, "Failed to mark notification queue item sent");
@@ -1078,6 +1131,134 @@ impl NotificationSender {
             NotificationChannel::ServerChan3 => {
                 let config = parse_instance_config::<ServerChan3Config>(channel)?;
                 self.send_serverchan3_message(&config, title.to_string(), text.to_string())
+                    .await
+            }
+        }
+    }
+
+    /// Send a custom JSON body to a channel, reusing each channel's authentication/signing.
+    /// The `rendered_body` is expected to be a valid JSON string with all placeholders already rendered.
+    async fn send_custom_body_to_channel(
+        &self,
+        channel: &NotificationChannelInstance,
+        rendered_body: &str,
+    ) -> Result<String, String> {
+        let payload: Value = serde_json::from_str(rendered_body)
+            .map_err(|e| format!("自定义请求体 JSON 格式错误: {}", e))?;
+
+        match channel.channel_type {
+            NotificationChannel::Webhook => {
+                let config = parse_instance_config::<WebhookConfig>(channel)?;
+                self.send_webhook_custom_body(&config, rendered_body).await
+            }
+            NotificationChannel::FeishuRobot => {
+                let config = parse_instance_config::<FeishuRobotConfig>(channel)?;
+                let url = robot_webhook_url(
+                    &config.webhook_url,
+                    &config.token,
+                    "https://open.feishu.cn/open-apis/bot/v2/hook/",
+                )?;
+                // Inject feishu signature into the payload if secret is configured
+                let final_payload = if !config.secret.trim().is_empty() {
+                    let mut obj = payload
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default();
+                    let timestamp = current_timestamp_secs().to_string();
+                    let sign_key = format!("{}\n{}", timestamp, config.secret.trim());
+                    let sign = hmac_sha256_base64(sign_key.as_bytes(), b"");
+                    obj.insert("timestamp".to_string(), json!(timestamp));
+                    obj.insert("sign".to_string(), json!(sign));
+                    Value::Object(obj)
+                } else {
+                    payload
+                };
+                self.post_json("飞书机器人", &url, final_payload).await
+            }
+            NotificationChannel::DingtalkRobot => {
+                let config = parse_instance_config::<DingtalkRobotConfig>(channel)?;
+                let mut url = robot_webhook_url(
+                    &config.webhook_url,
+                    &config.access_token,
+                    "https://oapi.dingtalk.com/robot/send?access_token=",
+                )?;
+                // Inject dingtalk signature into URL query
+                if !config.secret.trim().is_empty() {
+                    let timestamp = current_timestamp_millis();
+                    let to_sign = format!("{}\n{}", timestamp, config.secret.trim());
+                    let sign = hmac_sha256_base64(
+                        config.secret.trim().as_bytes(),
+                        to_sign.as_bytes(),
+                    );
+                    let separator = if url.contains('?') { '&' } else { '?' };
+                    url.push_str(&format!(
+                        "{}timestamp={}&sign={}",
+                        separator,
+                        timestamp,
+                        encode_query_value(&sign)
+                    ));
+                }
+                self.post_json("钉钉群自定义机器人", &url, payload).await
+            }
+            NotificationChannel::WecomRobot => {
+                let config = parse_instance_config::<WecomRobotConfig>(channel)?;
+                let url = robot_webhook_url(
+                    &config.webhook_url,
+                    &config.key,
+                    "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=",
+                )?;
+                self.post_json("企业微信群机器人", &url, payload).await
+            }
+            // For channels that don't have a natural "post arbitrary JSON" interface,
+            // we still try to post the custom body directly to their endpoint.
+            NotificationChannel::Bark => {
+                let config = parse_instance_config::<BarkConfig>(channel)?;
+                let server_url = config
+                    .server_url
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string();
+                if server_url.is_empty() || config.device_key.trim().is_empty() {
+                    return Err("Bark server URL 或 device key 未配置".to_string());
+                }
+                let url = format!("{}/push", server_url);
+                self.post_json("Bark", &url, payload).await
+            }
+            NotificationChannel::Telegram => {
+                let config = parse_instance_config::<TelegramConfig>(channel)?;
+                if config.bot_token.trim().is_empty() || config.chat_id.trim().is_empty() {
+                    return Err("Telegram Bot Token 或 Chat ID 未配置".to_string());
+                }
+                let url = telegram_send_message_url(&config);
+                self.post_json("Telegram", &url, payload).await
+            }
+            NotificationChannel::DingtalkApp => {
+                let config = parse_instance_config::<DingtalkAppConfig>(channel)?;
+                // DingtalkApp uses access_token from cache, same as normal flow
+                let text = serde_json::to_string(&payload).unwrap_or_default();
+                self.send_dingtalk_app_text(&config, text).await
+            }
+            NotificationChannel::WecomApp => {
+                let config = parse_instance_config::<WecomAppConfig>(channel)?;
+                let text = serde_json::to_string(&payload).unwrap_or_default();
+                self.send_wecom_app_text(&config, text).await
+            }
+            NotificationChannel::PushPlus => {
+                let config = parse_instance_config::<PushPlusConfig>(channel)?;
+                let text = serde_json::to_string_pretty(&payload).unwrap_or_default();
+                self.send_pushplus_message(&config, "自定义通知".to_string(), text)
+                    .await
+            }
+            NotificationChannel::Email => {
+                let config = parse_instance_config::<EmailConfig>(channel)?;
+                let text = serde_json::to_string_pretty(&payload).unwrap_or_default();
+                self.send_email_message(&config, "自定义通知".to_string(), text)
+                    .await
+            }
+            NotificationChannel::ServerChan3 => {
+                let config = parse_instance_config::<ServerChan3Config>(channel)?;
+                let text = serde_json::to_string_pretty(&payload).unwrap_or_default();
+                self.send_serverchan3_message(&config, "自定义通知".to_string(), text)
                     .await
             }
         }
@@ -1348,6 +1529,63 @@ impl NotificationSender {
 
         let response = request
             .body(text.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send webhook: {}", e))?;
+        response_result(
+            "Webhook",
+            response.status(),
+            response.text().await.unwrap_or_default(),
+        )
+    }
+
+    /// Send a custom body to a Webhook channel, supporting both POST and GET methods.
+    async fn send_webhook_custom_body(
+        &self,
+        config: &WebhookConfig,
+        body: &str,
+    ) -> Result<String, String> {
+        if config.url.trim().is_empty() {
+            return Err("Webhook URL is not configured".to_string());
+        }
+
+        let is_get = config.http_method.eq_ignore_ascii_case("GET");
+
+        let mut request = if is_get {
+            // For GET requests, we don't send a body
+            self.client.get(config.url.trim())
+        } else {
+            self.client.post(config.url.trim())
+        };
+
+        let mut has_content_type = false;
+        for (key, value) in &config.headers {
+            if key.eq_ignore_ascii_case("content-type") {
+                has_content_type = true;
+            }
+            request = request.header(key, value);
+        }
+
+        if !is_get && !has_content_type {
+            // Auto-detect: if body looks like JSON, use application/json
+            let trimmed = body.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                request = request.header("Content-Type", "application/json; charset=utf-8");
+            } else {
+                request = request.header("Content-Type", "text/plain; charset=utf-8");
+            }
+        }
+
+        if !config.secret.trim().is_empty() {
+            let signature = compute_legacy_signature(config.secret.trim(), body);
+            request = request.header("X-Webhook-Signature", signature);
+        }
+
+        if !is_get {
+            request = request.body(body.to_string());
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| format!("Failed to send webhook: {}", e))?;
@@ -3375,6 +3613,193 @@ fn response_result(label: &str, status: StatusCode, body: String) -> Result<Stri
     Ok(format!("{} test successful (status: {})", label, status))
 }
 
+fn contains_verification_code_placeholder(s: &str) -> bool {
+    s.contains("{{验证码}}") || s.contains("{{verification_code}}")
+}
+
+fn is_standalone_verification_code_line(line: &str) -> bool {
+    let rem = line
+        .replace("{{验证码}}", "")
+        .replace("{{verification_code}}", "");
+    let trimmed = rem.trim();
+
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let keywords = [
+        "验证码",
+        "动态验证码",
+        "verification code",
+        "verification_code",
+        "code",
+        "otp",
+        "captcha",
+        "passcode",
+    ];
+
+    let mut stripped = lower;
+    for kw in keywords {
+        stripped = stripped.replace(kw, "");
+    }
+
+    stripped.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ':' | '：'
+                    | '-'
+                    | '—'
+                    | '|'
+                    | ','
+                    | '，'
+                    | ';'
+                    | '；'
+                    | '['
+                    | ']'
+                    | '【'
+                    | '】'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '"'
+                    | '\''
+                    | '📱'
+                    | '💬'
+                    | '🔑'
+                    | '🔒'
+            )
+    })
+}
+
+fn clean_inline_verification_code_placeholder(text: &str) -> String {
+    let mut result = text.to_string();
+
+    let bracketed_patterns = [
+        "（验证码: {{验证码}}）",
+        "（验证码：{{验证码}}）",
+        "（验证码{{验证码}}）",
+        "(验证码: {{验证码}})",
+        "(验证码：{{验证码}})",
+        "(验证码{{验证码}})",
+        "【验证码: {{验证码}}】",
+        "【验证码：{{验证码}}】",
+        "[验证码: {{验证码}}]",
+        "[验证码：{{验证码}}]",
+        "(Code: {{verification_code}})",
+        "(Verification Code: {{verification_code}})",
+        "（verification_code: {{verification_code}}）",
+    ];
+    for p in bracketed_patterns {
+        result = result.replace(p, "");
+    }
+
+    let prefix_patterns = [
+        "：验证码: {{验证码}}",
+        "：验证码：{{验证码}}",
+        "：验证码{{验证码}}",
+        ": 验证码: {{验证码}}",
+        ": 验证码：{{验证码}}",
+        ": 验证码{{验证码}}",
+        " - 验证码: {{验证码}}",
+        " - 验证码：{{验证码}}",
+        " - 验证码{{验证码}}",
+        " | 验证码: {{验证码}}",
+        " | 验证码：{{验证码}}",
+        " | 验证码{{验证码}}",
+        "，验证码: {{验证码}}",
+        "，验证码：{{验证码}}",
+        "，验证码{{验证码}}",
+        ", 验证码: {{验证码}}",
+        ", 验证码：{{验证码}}",
+        ", 验证码{{验证码}}",
+        "；验证码: {{验证码}}",
+        "；验证码：{{验证码}}",
+        "；验证码{{验证码}}",
+        "; 验证码: {{验证码}}",
+        "; 验证码：{{验证码}}",
+        "; 验证码{{验证码}}",
+        "：Code: {{verification_code}}",
+        ": Code: {{verification_code}}",
+        " - Code: {{verification_code}}",
+        " | Code: {{verification_code}}",
+        ", Code: {{verification_code}}",
+        "：{{verification_code}}",
+        ": {{verification_code}}",
+        " - {{verification_code}}",
+        " | {{verification_code}}",
+        "：{{验证码}}",
+        ": {{验证码}}",
+        " - {{验证码}}",
+        " | {{验证码}}",
+    ];
+    for p in prefix_patterns {
+        result = result.replace(p, "");
+    }
+
+    let suffix_patterns = [
+        "验证码: {{验证码}}，",
+        "验证码：{{验证码}}，",
+        "验证码: {{验证码}}, ",
+        "验证码：{{验证码}}, ",
+        "验证码: {{验证码}}；",
+        "验证码：{{验证码}}；",
+        "验证码: {{验证码}}; ",
+        "验证码：{{验证码}}; ",
+        "验证码: {{验证码}} - ",
+        "验证码：{{验证码}} - ",
+        "验证码: {{验证码}} | ",
+        "验证码：{{验证码}} | ",
+        "验证码: {{验证码}}",
+        "验证码：{{验证码}}",
+        "验证码 {{验证码}}",
+        "验证码{{验证码}}",
+        "动态验证码: {{验证码}}",
+        "动态验证码：{{验证码}}",
+        "动态验证码{{验证码}}",
+        "Verification Code: {{verification_code}}, ",
+        "Verification Code: {{verification_code}}",
+        "Code: {{verification_code}}, ",
+        "Code: {{verification_code}}",
+        "Code {{verification_code}}",
+        "code: {{verification_code}}",
+    ];
+    for p in suffix_patterns {
+        result = result.replace(p, "");
+    }
+
+    result
+        .replace("{{验证码}}", "")
+        .replace("{{verification_code}}", "")
+}
+
+fn clean_empty_verification_code_template(template: &str) -> String {
+    if !contains_verification_code_placeholder(template) {
+        return template.to_string();
+    }
+
+    let original_lines: Vec<&str> = template.split('\n').collect();
+    let mut lines = Vec::new();
+
+    for line in original_lines {
+        let trimmed_line = line.trim_end_matches('\r');
+        if contains_verification_code_placeholder(trimmed_line) {
+            if is_standalone_verification_code_line(trimmed_line) {
+                continue;
+            } else {
+                lines.push(clean_inline_verification_code_placeholder(trimmed_line));
+            }
+        } else {
+            lines.push(trimmed_line.to_string());
+        }
+    }
+
+    let joined = lines.join("\n");
+    clean_inline_verification_code_placeholder(&joined)
+}
+
 fn render_sms_template(
     template: &str,
     message: &SmsMessage,
@@ -3399,7 +3824,13 @@ fn render_sms_template(
     let timestamp = render_time_value(&message.timestamp, escape_json);
     let verification_code = extract_verification_code(&message.content).unwrap_or_default();
 
-    let rendered = template
+    let template_to_use = if verification_code.is_empty() {
+        clean_empty_verification_code_template(template)
+    } else {
+        template.to_string()
+    };
+
+    let rendered = template_to_use
         .replace("{{id}}", &message.id.to_string())
         .replace("{{phone_number}}", &message.phone_number)
         .replace("{{发送方号码}}", &message.phone_number)
@@ -3611,6 +4042,7 @@ mod tests {
             event_codes: Vec::new(),
             title_template: String::new(),
             template: String::new(),
+            custom_body: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 1,
             device_status_items: crate::config::default_device_status_items(),
@@ -3642,6 +4074,7 @@ mod tests {
             event_codes: Vec::new(),
             title_template: String::new(),
             template: String::new(),
+            custom_body: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 5,
             device_status_items: crate::config::default_device_status_items(),
@@ -4068,19 +4501,34 @@ mod tests {
         assert_eq!(sms_event.render_title(""), "16600001111：验证码123456");
 
         let sms_without_code = SmsMessage {
-            content: "普通短信内容".to_string(),
+            content: "xxx气象台2026年07月27日00时25分发布暴雨橙色预警信号".to_string(),
+            phone_number: "1063".to_string(),
             ..sms_with_code
         };
         let sms_event = NotificationEvent::Sms {
             message: &sms_without_code,
             context: &context,
         };
-        assert_eq!(sms_event.render_title(""), "16600001111");
+        assert_eq!(sms_event.render_title(""), "1063");
         assert_eq!(
             sms_event.render_title(&crate::config::default_rule_title_template(
                 NotificationEventType::Sms
             )),
-            "16600001111"
+            "1063"
+        );
+
+        let multiline_template = "📱 短信通知\n号码: {{发送方号码}}\n验证码: {{验证码}}\n内容: {{短信内容}}";
+        let rendered_multiline = render_sms_template(multiline_template, &sms_without_code, &context, false);
+        assert_eq!(
+            rendered_multiline,
+            "📱 短信通知\n号码: 1063\n内容: xxx气象台2026年07月27日00时25分发布暴雨橙色预警信号"
+        );
+
+        let inline_template = "号码: {{发送方号码}}, 验证码: {{验证码}}, 内容: {{短信内容}}";
+        let rendered_inline = render_sms_template(inline_template, &sms_without_code, &context, false);
+        assert_eq!(
+            rendered_inline,
+            "号码: 1063, 内容: xxx气象台2026年07月27日00时25分发布暴雨橙色预警信号"
         );
 
         let ddns = DdnsEvent::default();
