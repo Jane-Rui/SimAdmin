@@ -78,7 +78,17 @@ jobs:
   build:
     needs: sync
     if: needs.sync.outputs.updated == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            arch_tag: aarch64
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            arch_tag: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,45 +112,53 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
-      - name: Build backend (x86_64-unknown-linux-musl，原生，无需交叉工具链)
+      - name: Install musl toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          cd backend
-          cargo build --release --target x86_64-unknown-linux-musl
+          musl-gcc --version
 
-      - uses: taiki-e/setup-cross-toolchain-action@v1
-        with:
-          target: aarch64-unknown-linux-musl
+      - name: Build backend (${{ matrix.target }})
+        working-directory: backend
+        env:
+          TARGET: ${{ matrix.target }}
+          SQLITE3_STATIC: '1'
+          LIBSQLITE3_SYS_USE_PKG_CONFIG: '0'
+        run: |
+          case "$TARGET" in
+            aarch64-unknown-linux-musl)
+              export CC_aarch64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+              ;;
+            x86_64-unknown-linux-musl)
+              export CC_x86_64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+              ;;
+          esac
+          cargo build --release --target "$TARGET"
+          file "target/$TARGET/release/simadmin"
 
-      - name: Build backend (aarch64-unknown-linux-musl，原生交叉编译，不走 cross/Docker)
-        run: cd backend && cargo build --release --target aarch64-unknown-linux-musl
-
-      - name: Package release assets
+      - name: Package release asset
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH_TAG: ${{ matrix.arch_tag }}
+          VERSION: ${{ needs.sync.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.sync.outputs.version }}"
           COMMIT=$(git rev-parse --short HEAD)
           BUILD_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%dT%H:%M:%S+08:00")
 
-          declare -A ARCH_TAGS=(
-            ["x86_64-unknown-linux-musl"]="x86_64"
-            ["aarch64-unknown-linux-musl"]="aarch64"
-          )
+          STAGE=$(mktemp -d)
+          cp "backend/target/$TARGET/release/simadmin" "$STAGE/simadmin"
+          chmod 755 "$STAGE/simadmin"
+          cp -r frontend/dist "$STAGE/www"
 
-          for TARGET in "${!ARCH_TAGS[@]}"; do
-            ARCH_TAG="${ARCH_TAGS[$TARGET]}"
-            STAGE=$(mktemp -d)
-            cp "backend/target/$TARGET/release/simadmin" "$STAGE/simadmin"
-            chmod 755 "$STAGE/simadmin"
-            cp -r frontend/dist "$STAGE/www"
+          BINARY_MD5=$(md5sum "$STAGE/simadmin" | cut -d' ' -f1)
+          FRONTEND_MD5=$(find "$STAGE/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
 
-            BINARY_MD5=$(md5sum "$STAGE/simadmin" | cut -d' ' -f1)
-            FRONTEND_MD5=$(find "$STAGE/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
-
-            cat > "$STAGE/meta.json" << EOF
+          cat > "$STAGE/meta.json" << EOF
           {
               "version": "$VERSION",
               "commit": "$COMMIT",
@@ -151,9 +169,26 @@ jobs:
           }
           EOF
 
-            tar -czf "simadmin-${ARCH_TAG}.tar.gz" -C "$STAGE" meta.json simadmin www
-            echo "打包完成: simadmin-${ARCH_TAG}.tar.gz ($TARGET)"
-          done
+          tar -czf "simadmin-${ARCH_TAG}.tar.gz" -C "$STAGE" meta.json simadmin www
+          echo "打包完成: simadmin-${ARCH_TAG}.tar.gz ($TARGET)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-${{ matrix.arch_tag }}
+          path: simadmin-${{ matrix.arch_tag }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download OTA artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ota-*
+          path: release
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -164,6 +199,6 @@ jobs:
             自动同步自上游 [3899/SimAdmin](https://github.com/3899/SimAdmin) 并多架构构建。
             包含 x86_64 与 aarch64 (musl) 两个架构的 OTA 包。
           files: |
-            simadmin-x86_64.tar.gz
-            simadmin-aarch64.tar.gz
+            release/simadmin-x86_64.tar.gz
+            release/simadmin-aarch64.tar.gz
           token: ${{ secrets.GITHUB_TOKEN }}
