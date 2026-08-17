@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       updated: ${{ steps.sync.outputs.updated }}
+      version_changed: ${{ steps.sync.outputs.version_changed }}
       version: ${{ steps.sync.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -33,11 +34,14 @@ jobs:
           git remote add upstream https://github.com/3899/SimAdmin.git
           git fetch upstream main
 
+          OLD_VERSION="$(tr -d '[:space:]' < VERSION)"
+
           NEW_COMMITS=$(git rev-list HEAD..upstream/main --count)
           if [ "$NEW_COMMITS" -eq 0 ]; then
             echo "没有上游更新"
             echo "updated=false" >> "$GITHUB_OUTPUT"
-            echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+            echo "version_changed=false" >> "$GITHUB_OUTPUT"
+            echo "version=${OLD_VERSION}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -72,12 +76,21 @@ jobs:
           fi
           git push origin HEAD:main
 
+          NEW_VERSION="$(tr -d '[:space:]' < VERSION)"
           echo "updated=true" >> "$GITHUB_OUTPUT"
-          echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+          if [ "${NEW_VERSION}" != "${OLD_VERSION}" ]; then
+            echo "版本号变化: ${OLD_VERSION} → ${NEW_VERSION}"
+            echo "version_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "版本号未变（仍为 ${NEW_VERSION}），跳过发版"
+            echo "version_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: sync
-    if: needs.sync.outputs.updated == 'true' || github.event_name == 'workflow_dispatch'
+    # 版本号变化才构建发版（同一版本内的上游提交只同步代码，不重复发版）
+    if: needs.sync.outputs.version_changed == 'true' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +113,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
@@ -190,7 +203,22 @@ jobs:
           path: release
           merge-multiple: true
 
+      - name: Check existing release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.sync.outputs.version }}"
+          if gh release view "v${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release v${VERSION} 已存在，跳过创建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.sync.outputs.version }}
