@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 jobs:
   sync:
@@ -134,7 +135,6 @@ jobs:
           musl-gcc --version
 
       - name: Build backend (${{ matrix.target }})
-        working-directory: backend
         env:
           TARGET: ${{ matrix.target }}
           SQLITE3_STATIC: '1'
@@ -150,46 +150,35 @@ jobs:
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
               ;;
           esac
-          cargo build --release --target "$TARGET"
+          cargo build --locked --release --target "$TARGET" -p simadmin
           file "target/$TARGET/release/simadmin"
 
       - name: Package release asset
         env:
           TARGET: ${{ matrix.target }}
-          ARCH_TAG: ${{ matrix.arch_tag }}
           VERSION: ${{ needs.sync.outputs.version }}
         run: |
           set -euo pipefail
-          COMMIT=$(git rev-parse --short HEAD)
-          BUILD_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%dT%H:%M:%S+08:00")
-
-          STAGE=$(mktemp -d)
-          cp "backend/target/$TARGET/release/simadmin" "$STAGE/simadmin"
-          chmod 755 "$STAGE/simadmin"
-          cp -r frontend/dist "$STAGE/www"
-
-          BINARY_MD5=$(md5sum "$STAGE/simadmin" | cut -d' ' -f1)
-          FRONTEND_MD5=$(find "$STAGE/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
-
-          cat > "$STAGE/meta.json" << EOF
-          {
-              "version": "$VERSION",
-              "commit": "$COMMIT",
-              "build_time": "$BUILD_TIME",
-              "binary_md5": "$BINARY_MD5",
-              "frontend_md5": "$FRONTEND_MD5",
-              "arch": "$TARGET"
-          }
-          EOF
-
-          tar -czf "simadmin-${ARCH_TAG}.tar.gz" -C "$STAGE" meta.json simadmin www
-          echo "打包完成: simadmin-${ARCH_TAG}.tar.gz ($TARGET)"
+          ./scripts/pack-ota.sh --target="$TARGET"
+          case "$TARGET" in
+            aarch64-unknown-linux-musl)
+              ARCH_SUFFIX="aarch64"
+              ;;
+            x86_64-unknown-linux-musl)
+              ARCH_SUFFIX="x86_64"
+              ;;
+          esac
+          SOURCE="release/simadmin_${VERSION}_${TARGET}.tar.gz"
+          DEST="release/simadmin-${ARCH_SUFFIX}.tar.gz"
+          mv "$SOURCE" "$DEST"
+          echo "打包完成: $DEST"
+          sha256sum release/*.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ota-${{ matrix.arch_tag }}
-          path: simadmin-${{ matrix.arch_tag }}.tar.gz
+          path: release/simadmin-${{ matrix.arch_tag }}.tar.gz
           if-no-files-found: error
 
   publish:
