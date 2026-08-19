@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -28,7 +28,7 @@ use simadmin_protocol::{
     LayerStatus, MessageAckPayload, OtaUpdateCommandPayload, SendSmsCommandPayload,
     SessionReadyPayload, SmsDirection, SmsItem, SmsStatus,
 };
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -61,6 +61,8 @@ pub struct HubRuntimeStatus {
     pub device_ids: Vec<String>,
     pub local_fallback_state: String,
     pub last_error: Option<String>,
+    #[serde(skip)]
+    offline_since: Option<DateTime<Utc>>,
 }
 
 impl Default for HubRuntimeStatus {
@@ -77,6 +79,7 @@ impl Default for HubRuntimeStatus {
             device_ids: Vec::new(),
             local_fallback_state: "inactive".into(),
             last_error: None,
+            offline_since: None,
         }
     }
 }
@@ -273,6 +276,8 @@ impl SimAdminExecutor {
                 }),
                 device_network: serde_json::to_value(self.app.config_manager.get_device_network())
                     .unwrap_or_default(),
+                vowifi: Value::Null,
+                volte: Value::Null,
                 phone: json!({}),
                 system: json!({
                     "system_info": read_system_info().ok(),
@@ -350,6 +355,9 @@ impl SimAdminExecutor {
                     .config_manager
                     .set_data_enabled(enabled)
                     .map_err(AgentError::Execution)?;
+                self.app
+                    .data_user_disabled
+                    .store(!enabled, Ordering::SeqCst);
                 Ok(json!({"enabled": enabled}))
             }
             DeviceAction::SetRoamingEnabled => {
@@ -745,10 +753,12 @@ impl AgentExecutor for SimAdminExecutor {
         status.online = online;
         status.connection_state = if online { "connected" } else { "offline" }.into();
         if online {
+            status.offline_since = None;
             status.last_connected_at = Some(Utc::now());
             status.last_error = None;
             status.local_fallback_state = "standby".into();
         } else if status.enabled {
+            status.offline_since.get_or_insert_with(Utc::now);
             status.local_fallback_state = if self
                 .app
                 .config_manager
@@ -781,6 +791,7 @@ impl AgentExecutor for SimAdminExecutor {
         }
         let mut status = self.status.write().await;
         status.online = false;
+        status.offline_since.get_or_insert_with(Utc::now);
         status.connection_state = if matches!(error, AgentError::PairingPending(_)) {
             "awaiting_approval"
         } else {
@@ -1017,6 +1028,7 @@ impl HubAgentManager {
                 "disabled"
             }
             .into(),
+            offline_since: hub.enabled.then(Utc::now),
             ..Default::default()
         };
         *self.status.write().await = next_status;
@@ -1032,7 +1044,22 @@ impl HubAgentManager {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     interval.tick().await;
-                    if fallback_status.read().await.online {
+                    let fallback_active = {
+                        let mut status = fallback_status.write().await;
+                        if status.online {
+                            false
+                        } else {
+                            let active = local_fallback_timeout_elapsed(
+                                status.offline_since,
+                                timeout,
+                                Utc::now(),
+                            );
+                            status.local_fallback_state =
+                                if active { "active" } else { "armed" }.into();
+                            active
+                        }
+                    };
+                    if !fallback_active {
                         continue;
                     }
                     match fallback_app
@@ -1116,13 +1143,15 @@ impl HubAgentManager {
         let status = self.status.clone();
         let active_generation = self.active_generation.clone();
         lifecycle.runtime_task = Some(tokio::spawn(async move {
+            let business_wakeup = hub_business_wakeup().clone();
             let executor = Arc::new(SimAdminExecutor::new(
                 app,
                 status.clone(),
                 generation,
                 active_generation.clone(),
             ));
-            let runtime = AgentRuntime::new(store, executor, config);
+            let runtime =
+                AgentRuntime::new(store, executor, config).with_business_wakeup(business_wakeup);
             if let Err(error) = runtime.run_forever().await {
                 if active_generation.load(Ordering::SeqCst) == generation {
                     status.write().await.last_error = Some(error.to_string());
@@ -1279,6 +1308,11 @@ fn router_cell() -> &'static std::sync::OnceLock<Router> {
     &ROUTER
 }
 
+fn hub_business_wakeup() -> &'static Arc<Notify> {
+    static WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
+    WAKEUP.get_or_init(|| Arc::new(Notify::new()))
+}
+
 pub fn configure_device_api_router(router: Router) {
     let _ = router_cell().set(router);
 }
@@ -1300,6 +1334,37 @@ pub async fn runtime_status(config: &HubConfig) -> HubRuntimeStatus {
             ..Default::default()
         },
     }
+}
+
+pub async fn local_automation_scheduling_enabled(config: &HubConfig) -> bool {
+    let status = runtime_status(config).await;
+    local_automation_scheduling_enabled_at(config, &status, Utc::now())
+}
+
+fn local_automation_scheduling_enabled_at(
+    config: &HubConfig,
+    status: &HubRuntimeStatus,
+    now: DateTime<Utc>,
+) -> bool {
+    !config.enabled
+        || (config.local_fallback_enabled
+            && !status.online
+            && local_fallback_timeout_elapsed(
+                status.offline_since,
+                config.local_fallback_timeout_seconds.max(30),
+                now,
+            ))
+}
+
+fn local_fallback_timeout_elapsed(
+    offline_since: Option<DateTime<Utc>>,
+    timeout_seconds: u64,
+    now: DateTime<Utc>,
+) -> bool {
+    offline_since.is_some_and(|offline_since| {
+        now.signed_duration_since(offline_since).num_seconds()
+            >= timeout_seconds.min(i64::MAX as u64) as i64
+    })
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -1430,6 +1495,7 @@ pub async fn queue_notification_event(
     database
         .enqueue_hub_event(&event)
         .map_err(|error| error.to_string())?;
+    hub_business_wakeup().notify_one();
     Ok(online || config.enabled)
 }
 
@@ -1472,6 +1538,71 @@ mod tests {
         assert_ne!(lifecycle_key(&independent), lifecycle_key(&managed));
         assert_ne!(lifecycle_key(&managed), lifecycle_key(&connected));
         assert_ne!(lifecycle_key(&connected), lifecycle_key(&fallback_disabled));
+    }
+
+    #[test]
+    fn local_fallback_waits_for_the_full_offline_timeout() {
+        let now = Utc::now();
+        assert!(!local_fallback_timeout_elapsed(
+            Some(now - chrono::Duration::seconds(119)),
+            120,
+            now
+        ));
+        assert!(local_fallback_timeout_elapsed(
+            Some(now - chrono::Duration::seconds(120)),
+            120,
+            now
+        ));
+        assert!(!local_fallback_timeout_elapsed(None, 120, now));
+    }
+
+    #[test]
+    fn local_automation_switches_between_hub_ownership_and_device_fallback() {
+        let now = Utc::now();
+        let independent = HubConfig::default();
+        assert!(local_automation_scheduling_enabled_at(
+            &independent,
+            &HubRuntimeStatus::default(),
+            now
+        ));
+
+        let managed = HubConfig {
+            enabled: true,
+            ..HubConfig::default()
+        };
+        let online = HubRuntimeStatus {
+            online: true,
+            ..Default::default()
+        };
+        assert!(!local_automation_scheduling_enabled_at(
+            &managed, &online, now
+        ));
+
+        let waiting = HubRuntimeStatus {
+            offline_since: Some(now - chrono::Duration::seconds(119)),
+            ..Default::default()
+        };
+        assert!(!local_automation_scheduling_enabled_at(
+            &managed, &waiting, now
+        ));
+
+        let fallback = HubRuntimeStatus {
+            offline_since: Some(now - chrono::Duration::seconds(120)),
+            ..Default::default()
+        };
+        assert!(local_automation_scheduling_enabled_at(
+            &managed, &fallback, now
+        ));
+
+        let fallback_disabled = HubConfig {
+            local_fallback_enabled: false,
+            ..managed
+        };
+        assert!(!local_automation_scheduling_enabled_at(
+            &fallback_disabled,
+            &fallback,
+            now
+        ));
     }
 
     #[test]
