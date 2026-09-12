@@ -7,7 +7,7 @@
 ├── backend/          # Rust + Axum 后端，ModemManager、SQLite、OTA、通知、系统接口
 ├── frontend/         # React + Vite + MUI 前端
 ├── bruno-api/        # Bruno API 调试集合
-├── scripts/          # 构建、部署、systemd、modem 恢复脚本
+├── scripts/          # 构建(build)、系统服务(system)、测试(tests)、评测工具(tool)
 ├── install_latest.sh # 设备侧一键安装 / 升级脚本
 ├── uninstall.sh      # 设备侧一键卸载脚本
 ├── VERSION           # 项目版本号
@@ -59,49 +59,84 @@ cargo run -- --host :: --port 3000
 ### 构建完整 OTA 包
 
 ```bash
-./scripts/build.sh
+./scripts/build/build.sh
 ```
 
 #### 常用选项
 
 ```bash
-./scripts/build.sh --backend-only
-./scripts/build.sh --frontend-only
-./scripts/build.sh --no-upx
-./scripts/build.sh --no-ota
-./scripts/build.sh --target=x86_64
+./scripts/build/build.sh --backend-only
+./scripts/build/build.sh --frontend-only
+./scripts/build/build.sh --no-upx
+./scripts/build/build.sh --no-ota
+./scripts/build/build.sh --target=x86_64
+./scripts/build/build.sh --target=armv7 --no-upx
 ```
 
 *Windows 下建议在 WSL2 Ubuntu 中执行完整 OTA 构建。原生 PowerShell 不能直接运行 Bash 脚本；Git Bash 容易受 Node/npm/pnpm PATH 影响，完整 OTA 仍需要目标架构对应的 Linux musl 工具链：*
 
 ```bash
-./scripts/build.sh --no-upx
+./scripts/build/build.sh --no-upx
 ```
+
+ARMv7 本地后端交叉编译需要 `armv7-unknown-linux-musleabihf` Rust target 和
+`arm-linux-musleabihf-gcc` linker。没有本机 ARMv7 musl 工具链时，可在安装 Docker
+后使用 cross-rs（CI 使用同一目标镜像）：
+
+```bash
+rustup target add armv7-unknown-linux-musleabihf
+cargo install cross --locked
+cross build --locked --release --target armv7-unknown-linux-musleabihf -p simadmin
+```
+
+在没有 ARMv7 工具链的主机上，可以先运行与工具链无关的边界检查：
+
+```bash
+bash ./scripts/tests/test-armv7.sh
+```
+
+该检查覆盖架构别名、ARMv7 OTA 产物命名、Shell 语法，以及 ARMv7 强制跳过
+`lpac`（包括显式 ARM64 覆盖变量）。它不能替代 CI 交叉编译、QEMU 启动或 UFI210
+真机验收。
+
+生成 OTA 包前仍需先构建前端，然后执行
+`./scripts/build/pack-ota.sh --target=armv7`；打包脚本会拒绝非 ARM ELF32 后端。
 
 #### 构建脚本动作说明
 
 - 同步 `VERSION` 到 `backend/Cargo.toml` 和 `frontend/package.json`。
 - 使用 `pnpm-lock.yaml` 时通过 `pnpm install --frozen-lockfile`、`pnpm run lint` 和 `pnpm exec vite build` 构建前端到 `frontend/dist/`。
-- 默认交叉编译后端到 `target/aarch64-unknown-linux-musl/release/simadmin`；传入 `--target=x86_64` 时生成 `target/x86_64-unknown-linux-musl/release/simadmin`。
-- 可选使用 UPX 压缩后端二进制；未安装 UPX 时会自动跳过压缩。
+- 默认交叉编译后端到 `target/aarch64-unknown-linux-musl/release/simadmin`；传入 `--target=armv7` 时生成 `target/armv7-unknown-linux-musleabihf/release/simadmin`，传入 `--target=x86_64` 时生成 `target/x86_64-unknown-linux-musl/release/simadmin`。
+- 可选使用 UPX 压缩后端二进制；未安装 UPX 时会自动跳过压缩。ARMv7 默认跳过 UPX，待 UFI210 真机验收后可通过 `SIMADMIN_ALLOW_UPX_ARMV7=1` 显式启用。
 - 生成 `release/simadmin_<version>_<target>.tar.gz` OTA 包，并在 `meta.json` 中写入相同 target triple。
 
-GitHub Actions 会在 ARM64 与 x86_64 原生 runner 上并行构建，发布 `simadmin-arm64.tar.gz` 与 `simadmin-amd64.tar.gz`；`simadmin.tar.gz` 继续作为 ARM64 兼容别名。
+GitHub Actions 会构建 ARM64、ARMv7 hard-float 和 x86_64 三种产物，发布 `simadmin-aarch64.tar.gz`、`simadmin-armv7.tar.gz` 与 `simadmin-x86_64.tar.gz`。ARMv7 使用 cross-rs 交叉工具链；`simadmin.tar.gz` 继续作为 ARM64 兼容别名。
+
+#### Windows PowerShell 构建
+
+`build/build-simadmin.ps1` 使用 Windows 上的 Zig C 工具链和 Rust target 构建完整 OTA 包，默认目标仍为 AArch64。构建 ARMv7 hard-float 包：
+
+```powershell
+pwsh -File .\build\build-simadmin.ps1 -Target armv7
+```
+
+脚本也接受 `armv7l`、`armhf` 和完整 target triple 作为 `-Target` 值，会自动安装缺失的 Rust target，并在打包前校验 ARM ELF32 hard-float 头。ARMv7 默认输出 `release/simadmin_<version>_armv7.tar.gz`，同时生成供安装脚本使用的 `release/simadmin-armv7.tar.gz`；使用 `-NoLatestAlias` 可关闭别名。若依赖已安装，可加 `-NoInstall` 跳过 `pnpm install`。
 
 ### 通过 ADB 部署
 
 ```bash
-./scripts/deploy.sh
+./scripts/build/deploy.sh
 ```
 
 #### 常用选项
 
 ```bash
-./scripts/deploy.sh --backend-only
-./scripts/deploy.sh --frontend-only
-./scripts/deploy.sh --no-restart
-./scripts/deploy.sh --target=/opt/simadmin
-./scripts/deploy.sh --build-target=x86_64
+./scripts/build/deploy.sh --backend-only
+./scripts/build/deploy.sh --frontend-only
+./scripts/build/deploy.sh --no-restart
+./scripts/build/deploy.sh --target=/opt/simadmin
+./scripts/build/deploy.sh --build-target=x86_64
+./scripts/build/deploy.sh --build-target=armv7
 ```
 
 ---
@@ -154,6 +189,7 @@ pub async fn set_some_modem_state(conn: &Connection) -> zbus::Result<()> {
 - `APP_VERSION`
 - `GIT_BRANCH`
 - `GIT_COMMIT`
+- `APP_TARGET_TRIPLE`
 
 其中版本号来自根目录 `VERSION`。
 

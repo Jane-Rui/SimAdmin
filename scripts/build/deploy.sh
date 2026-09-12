@@ -5,7 +5,7 @@
 set -e
 
 # 切换到项目根目录
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # 默认配置
 TARGET_PATH="/opt/simadmin"
@@ -33,14 +33,14 @@ for arg in "$@"; do
             BUILD_TARGET="${arg#*=}"
             ;;
         --help|-h)
-            echo "用法: ./scripts/deploy.sh [选项]"
+            echo "用法: ./scripts/build/deploy.sh [选项]"
             echo ""
             echo "选项:"
             echo "  --backend-only   只部署后端"
             echo "  --frontend-only  只部署前端"
             echo "  --no-restart     不重启服务（默认会停止现有服务）"
             echo "  --target=PATH    指定目标路径 (默认: /opt/simadmin)"
-            echo "  --build-target=TARGET  后端构建目标: aarch64 或 x86_64"
+            echo "  --build-target=TARGET  后端构建目标: aarch64、armv7 或 x86_64"
             echo "  --help, -h       显示帮助信息"
             echo ""
             echo "示例:"
@@ -62,8 +62,9 @@ done
 
 case "$BUILD_TARGET" in
     aarch64|arm64) BUILD_TARGET="aarch64-unknown-linux-musl" ;;
+    armv7|armv7l|armhf) BUILD_TARGET="armv7-unknown-linux-musleabihf" ;;
     x86_64|amd64) BUILD_TARGET="x86_64-unknown-linux-musl" ;;
-    aarch64-unknown-linux-musl|x86_64-unknown-linux-musl) ;;
+    aarch64-unknown-linux-musl|armv7-unknown-linux-musleabihf|x86_64-unknown-linux-musl) ;;
     *)
         echo "❌ 错误: 不支持的后端构建目标: $BUILD_TARGET" >&2
         exit 1

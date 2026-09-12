@@ -38,6 +38,7 @@ mod hub_agent;
 mod iptables;
 mod models;
 mod modem_manager;
+mod modem_recovery;
 mod notification;
 mod notification_queue;
 mod ota;
@@ -153,7 +154,9 @@ async fn spa_fallback(uri: Uri) -> Response {
 /// 这完美绕过了 Modem.Command 的 Unauthorized 限制，同时保持系统纯净。
 fn ensure_modemmanager_debug_override() {
     let override_dir = "/etc/systemd/system/ModemManager.service.d";
-    let override_file = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
+    let legacy_override_file = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
+    let override_file = "/etc/systemd/system/ModemManager.service.d/zz-simadmin-debug.conf";
+    let _ = std::fs::remove_file(legacy_override_file);
 
     let desired_content = "\
 # SimAdmin: enable ModemManager debug mode so that Modem.Command D-Bus
@@ -316,6 +319,7 @@ async fn main() -> Result<()> {
 
     // 确保 ModemManager 已提权以支持 AT 指令读取短信中心
     ensure_modemmanager_debug_override();
+    modem_recovery::ensure_modem_recovery_assets_installed();
 
     // Connect to system D-Bus
     let dbus_conn = Arc::new(Connection::system().await?);
