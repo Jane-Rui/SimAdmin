@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -210,6 +211,39 @@ impl AgentStore {
             .execute("UPDATE agent_outbox SET attempt_count=0", [])?;
         Ok(())
     }
+    pub fn update_envelope(&self, envelope: &Envelope) -> AgentResult<()> {
+        let json = serde_json::to_string(envelope)?;
+        self.connection.lock().unwrap().execute(
+            "UPDATE agent_outbox SET envelope_json=?2 WHERE message_id=?1",
+            params![envelope.message_id, json],
+        )?;
+        Ok(())
+    }
+    pub fn realign_outbox_agent_id(&self, target_agent_id: &str) -> AgentResult<usize> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare("SELECT message_id, envelope_json FROM agent_outbox")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut updated = 0;
+        for (message_id, json_str) in rows {
+            if let Ok(mut envelope) = serde_json::from_str::<Envelope>(&json_str) {
+                if envelope.agent_id != target_agent_id {
+                    envelope.agent_id = target_agent_id.to_string();
+                    if let Ok(new_json) = serde_json::to_string(&envelope) {
+                        connection.execute(
+                            "UPDATE agent_outbox SET envelope_json=?2 WHERE message_id=?1",
+                            params![message_id, new_json],
+                        )?;
+                        updated += 1;
+                    }
+                }
+            }
+        }
+        Ok(updated)
+    }
     pub fn has_pending_item(&self, message_type: &str, item_id: &str) -> AgentResult<bool> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
@@ -228,6 +262,11 @@ impl AgentStore {
                     .any(|item| item.item_id == item_id),
                 "event_batch" => envelope
                     .decode_payload::<simadmin_protocol::EventBatchPayload>()?
+                    .items
+                    .iter()
+                    .any(|item| item.item_id == item_id),
+                "sms_deleted_batch" => envelope
+                    .decode_payload::<simadmin_protocol::SmsDeletedBatchPayload>()?
                     .items
                     .iter()
                     .any(|item| item.item_id == item_id),
@@ -500,6 +539,12 @@ pub trait AgentExecutor: Send + Sync + 'static {
     ) -> AgentResult<Vec<simadmin_protocol::SmsItem>> {
         Ok(vec![])
     }
+    async fn deleted_sms_items(
+        &self,
+        _device_ids: &[String],
+    ) -> AgentResult<Vec<simadmin_protocol::SmsDeletedItem>> {
+        Ok(vec![])
+    }
     async fn event_items(
         &self,
         _device_ids: &[String],
@@ -599,10 +644,11 @@ impl<E: AgentExecutor> AgentRuntime<E> {
                 .json::<ApiEnvelope<AgentRegistrationResponse>>()
                 .await?
                 .data;
-            self.config.agent_id = Some(response.agent_id);
+            self.config.agent_id = Some(response.agent_id.clone());
             self.config.pairing_code = Some(response.pairing_code);
             self.config.enrollment_token = None;
             self.store.save_config(&self.config)?;
+            self.store.realign_outbox_agent_id(&response.agent_id)?;
             self.executor.agent_config_changed(&self.config).await;
         }
         let agent_id = self
@@ -697,6 +743,7 @@ impl<E: AgentExecutor> AgentRuntime<E> {
         self.executor.session_ready(&session).await;
         self.executor.session_state_changed(true).await;
         let _session_guard = SessionGuard(self.executor.clone());
+        self.store.realign_outbox_agent_id(&agent_id)?;
         self.store.reset_outbox_attempts()?;
         self.enqueue_status().await?;
         self.enqueue_discovery().await?;
@@ -758,7 +805,27 @@ impl<E: AgentExecutor> AgentRuntime<E> {
                 )?)?;
             }
         }
-        let events = self.store.retain_undelivered(
+        let deleted_sms = self.store.retain_undelivered(
+            "sms_deleted_batch",
+            self.executor.deleted_sms_items(&self.config.device_ids).await?,
+            |item| item.item_id.as_str(),
+        )?;
+        for item in deleted_sms {
+            if !self.store.has_pending_item("sms_deleted_batch", &item.item_id)? {
+                self.store.enqueue(&Envelope::new(
+                    "sms_deleted_batch",
+                    &agent_id,
+                    item.device_id.clone(),
+                    None,
+                    simadmin_protocol::SmsDeletedBatchPayload {
+                        items: vec![item.clone()],
+                        item_ids: vec![item.item_id.clone()],
+                        device_id: item.device_id.clone(),
+                    },
+                )?)?;
+            }
+        }
+                let events = self.store.retain_undelivered(
             "event_batch",
             self.executor.event_items(&self.config.device_ids).await?,
             |item| item.item_id.as_str(),
@@ -780,15 +847,18 @@ impl<E: AgentExecutor> AgentRuntime<E> {
     where
         S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
+        let current_agent_id = self.config.agent_id.as_deref().unwrap_or_default();
         let envelopes = self.store.unsent_outbox()?;
-        for envelope in &envelopes {
+        let mut message_ids = Vec::with_capacity(envelopes.len());
+        for mut envelope in envelopes {
+            if !current_agent_id.is_empty() && envelope.agent_id != current_agent_id {
+                envelope.agent_id = current_agent_id.to_string();
+                let _ = self.store.update_envelope(&envelope);
+            }
             sink.send(Message::Text(serde_json::to_string(&envelope)?.into()))
                 .await?;
+            message_ids.push(envelope.message_id);
         }
-        let message_ids = envelopes
-            .into_iter()
-            .map(|envelope| envelope.message_id)
-            .collect::<Vec<_>>();
         self.store.mark_outbox_attempts(&message_ids)?;
         Ok(())
     }
@@ -960,6 +1030,21 @@ impl<E: AgentExecutor> AgentRuntime<E> {
                 self.flush_outbox(sink).await?;
             }
             "heartbeat_ack" | "session_ready" => {}
+            "error" => {
+                if let Some(source_message_id) = envelope.correlation_id.as_deref() {
+                    let err_msg = envelope
+                        .decode_payload::<HashMap<String, String>>()
+                        .ok()
+                        .and_then(|m| m.get("message").cloned())
+                        .unwrap_or_else(|| "protocol_error".into());
+                    tracing::warn!(%source_message_id, error = %err_msg, "server rejected outbox message, moving to dead letters");
+                    let _ = self.store.reject_message(
+                        source_message_id,
+                        Some("protocol_error"),
+                        Some(&err_msg),
+                    );
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -1159,5 +1244,24 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.outbox().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn outbox_realigns_agent_id_and_rejects_protocol_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AgentStore::open(temp.path().join("agent.db")).unwrap();
+        let old_envelope =
+            Envelope::new("sms_batch", "old-agent", None, None, serde_json::json!({"items":[]})).unwrap();
+        store.enqueue(&old_envelope).unwrap();
+        assert_eq!(store.outbox().unwrap()[0].agent_id, "old-agent");
+
+        let updated = store.realign_outbox_agent_id("new-agent").unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(store.outbox().unwrap()[0].agent_id, "new-agent");
+
+        store
+            .reject_message(&old_envelope.message_id, Some("protocol_error"), Some("unauthorized"))
+            .unwrap();
+        assert!(store.outbox().unwrap().is_empty());
     }
 }

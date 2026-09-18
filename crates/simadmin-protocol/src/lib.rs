@@ -1,3 +1,10 @@
+﻿pub use simadmin_sms_core as sms;
+pub use simadmin_sms_core::{
+    clean_empty_verification_code_template, compute_content_hash, compute_pdu_hash,
+    compute_sms_fingerprint, extract_verification_code, format_beijing_time, is_phone_number_match,
+    mask_phone_number, normalize_phone_number, parse_and_normalize_timestamp, AssembledSms,
+    SmsAssembler,
+};
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -429,6 +436,23 @@ pub struct DeviceStatusBatchPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SmsBatchPayload {
     pub items: Vec<SmsItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmsDeletedItem {
+    pub item_id: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmsDeletedBatchPayload {
+    #[serde(default)]
+    pub items: Vec<SmsDeletedItem>,
+    #[serde(default)]
+    pub item_ids: Vec<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -893,7 +917,7 @@ mod tests {
             None,
             HeartbeatPayload {
                 agent_type: AgentType::Simadmin,
-                agent_version: "1.2.0".into(),
+                agent_version: "1.2.1".into(),
                 session_generation: 4,
                 managed_device_count: 1,
                 local_queue_size: 0,
