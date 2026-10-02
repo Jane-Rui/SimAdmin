@@ -3,8 +3,6 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs;
-#[cfg(unix)]
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -25,8 +23,9 @@ use crate::{
         AirplaneModeResponse, ApnContext, ApnListResponse, BandLockRequest, BandLockStatus,
         BasebandRestartResponse, BasebandRestartStep, CallInfo, CallListResponse,
         CallSettingsResponse, CellInfo, CellLocationInfo, CellLocationResponse, CellsResponse,
-        DeviceInfoResponse, NetworkInfoResponse, OperatorInfo, OperatorListResponse, RadioMode,
-        RadioModeResponse, ServingCell, SetApnRequest, SignalStrengthResponse, SimInfoResponse,
+        DataPathHealth, DeviceInfoResponse, NetworkInfoResponse, NetworkInterfaceInfo,
+        OperatorInfo, OperatorListResponse, RadioMode, RadioModeResponse, ServingCell,
+        SetApnRequest, SignalStrengthResponse, SimInfoResponse,
     },
     serial::with_serial,
     system_event::{
@@ -65,6 +64,8 @@ const NETWORK_REGISTER_TIMEOUT_SECS: u64 = 45;
 const SEARCHING_REGISTER_THRESHOLD: u32 = 4;
 const SEARCHING_RADIO_RESET_THRESHOLD: u32 = 8;
 const DATA_CONNECT_RETRY_COOLDOWN_SECS: u64 = 120;
+const DATA_PATH_HEALTH_RETRY_COUNT: usize = 6;
+const DATA_PATH_HEALTH_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const NM_CREATED_PROFILE_NAME: &str = "simadmin-modem";
 const MM_MODEM_STATE_REGISTERED: i32 = 8;
 const MM_MODEM_STATE_DISCONNECTING: i32 = 9;
@@ -265,7 +266,8 @@ fn is_plausible_smsc(value: &str) -> bool {
 }
 
 fn normalize_smsc(value: &str) -> String {
-    let value = value
+    let decoded = simadmin_device_runtime::decode_hex_ucs2_if_needed(value);
+    let value = decoded
         .trim()
         .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';'))
         .trim();
@@ -1154,12 +1156,19 @@ pub async fn current_sim_identity(conn: &Connection) -> Option<SimIdentity> {
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM)
         .await
         .unwrap_or_default();
-    let iccid = crate::utils::normalize_iccid(
+    let mut iccid = crate::utils::normalize_iccid(
         &sim_props
             .get("SimIdentifier")
             .map(extract_string)
             .unwrap_or_default(),
     );
+    if iccid.is_empty() {
+        if let Ok(modem_ctx) = ModemContext::new(conn, &modem_path) {
+            if let Some(fallback) = modem_ctx.fallback_iccid().await {
+                iccid = crate::utils::normalize_iccid(&fallback);
+            }
+        }
+    }
     let imsi = sim_props
         .get("Imsi")
         .map(extract_string)
@@ -1750,7 +1759,15 @@ async fn refresh_sim_details_background_inner(conn: &Connection, db: &Database, 
     if force || own_number_cache_entry_for_identity(db, &identity).is_none() {
         let mut phone_numbers = Vec::new();
         if let Some(path) = modem_path.as_deref() {
-            phone_numbers = simple_status_own_numbers_fallback(conn, path).await;
+            if let Ok(output) = send_at_via_modem_command(conn, path, "AT+CNUM").await {
+                let own = simadmin_device_runtime::extract_own_number_from_cnum_output(&output);
+                if !own.is_empty() {
+                    phone_numbers = vec![own];
+                }
+            }
+            if phone_numbers.is_empty() {
+                phone_numbers = simple_status_own_numbers_fallback(conn, path).await;
+            }
             if phone_numbers.is_empty() {
                 phone_numbers = active_protocol_own_numbers_fallback(conn, path).await;
             }
@@ -1773,7 +1790,10 @@ async fn refresh_sim_details_background_inner(conn: &Connection, db: &Database, 
         if sms_center.is_empty() {
             if let Some(path) = modem_path.as_deref() {
                 if let Ok(output) = send_at_via_modem_command(conn, path, "AT+CSCA?").await {
-                    sms_center = parse_smsc_from_at_output(&output);
+                    sms_center = simadmin_device_runtime::extract_smsc_from_csca_output(&output);
+                    if sms_center.is_empty() {
+                        sms_center = parse_smsc_from_at_output(&output);
+                    }
                     source = "background_at";
                 }
             }
@@ -2343,6 +2363,101 @@ async fn get_cells_data_qmicli(
 mod tests {
     use super::*;
 
+    fn data_interface(
+        name: &str,
+        status: &str,
+        addresses: Vec<crate::models::IpAddress>,
+    ) -> NetworkInterfaceInfo {
+        NetworkInterfaceInfo {
+            name: name.to_string(),
+            status: status.to_string(),
+            ip_addresses: addresses,
+            ..NetworkInterfaceInfo::default()
+        }
+    }
+
+    fn private_ipv4_address() -> crate::models::IpAddress {
+        crate::models::IpAddress {
+            address: "10.0.0.2".to_string(),
+            prefix_len: 24,
+            ip_type: "ipv4".to_string(),
+            scope: "private".to_string(),
+        }
+    }
+
+    #[test]
+    fn data_path_is_healthy_only_when_profile_device_is_up_with_an_address() {
+        let interfaces = vec![data_interface("wwan0", "up", vec![private_ipv4_address()])];
+
+        let health =
+            data_path_health_from_interfaces(true, true, &["wwan0".to_string()], &interfaces);
+
+        assert!(health.control_plane_connected);
+        assert!(health.profile_active);
+        assert!(health.data_plane_ready);
+        assert_eq!(health.interface.as_deref(), Some("wwan0"));
+        assert!(health.has_address);
+    }
+
+    #[test]
+    fn data_path_rejects_a_down_interface_even_if_a_stale_address_is_visible() {
+        let interfaces = vec![data_interface(
+            "wwan0",
+            "down",
+            vec![private_ipv4_address()],
+        )];
+
+        let health =
+            data_path_health_from_interfaces(true, true, &["wwan0".to_string()], &interfaces);
+
+        assert!(!health.data_plane_ready);
+        assert!(health.has_address);
+        assert_eq!(
+            health.reason.as_deref(),
+            Some("Cellular data interface wwan0 is down")
+        );
+    }
+
+    #[test]
+    fn data_path_requires_an_active_networkmanager_profile() {
+        let interfaces = vec![data_interface("wwan0", "up", vec![private_ipv4_address()])];
+
+        let health =
+            data_path_health_from_interfaces(true, false, &["wwan0".to_string()], &interfaces);
+
+        assert!(!health.data_plane_ready);
+        assert_eq!(
+            health.reason.as_deref(),
+            Some("NetworkManager cellular data profile is not active")
+        );
+    }
+
+    #[test]
+    fn data_path_uses_only_the_networkmanager_profile_device() {
+        let interfaces = vec![
+            data_interface("wwan0", "down", vec![private_ipv4_address()]),
+            data_interface("wwan1", "up", vec![private_ipv4_address()]),
+        ];
+
+        let health =
+            data_path_health_from_interfaces(true, true, &["wwan0".to_string()], &interfaces);
+
+        assert!(!health.data_plane_ready);
+        assert_eq!(health.interface.as_deref(), Some("wwan0"));
+    }
+
+    #[test]
+    fn parses_networkmanager_profile_runtime_state_without_matching_deactivated() {
+        assert_eq!(
+            parse_nm_connection_runtime_state("activated\nwwan0\n"),
+            (true, vec!["wwan0".to_string()])
+        );
+        assert_eq!(
+            parse_nm_connection_runtime_state("deactivated\n--\n"),
+            (false, Vec::<String>::new())
+        );
+    }
+
     #[test]
     fn treats_only_data_attach_transitions_as_connection_in_progress() {
         assert!(!data_connection_transition_in_progress(
@@ -2838,6 +2953,68 @@ LTE Timing Advance: 'unavailable'"#;
 
         assert_eq!(dedup_apn_contexts(contexts).len(), 2);
     }
+
+    #[test]
+    fn maps_earfcn_to_lte_bands() {
+        assert_eq!(lte_band_from_earfcn(100), Some("B1"));
+        assert_eq!(lte_band_from_earfcn(1300), Some("B3"));
+        assert_eq!(lte_band_from_earfcn(2450), Some("B5"));
+        assert_eq!(lte_band_from_earfcn(3590), Some("B8"));
+        assert_eq!(lte_band_from_earfcn(9410), Some("B28"));
+        assert_eq!(lte_band_from_earfcn(38400), Some("B39"));
+        assert_eq!(lte_band_from_earfcn(39000), Some("B40"));
+        assert_eq!(lte_band_from_earfcn(40936), Some("B41"));
+        assert_eq!(lte_band_from_earfcn(999999), None);
+    }
+
+    #[test]
+    fn parses_muestats_cell_metrics_and_bands() {
+        let output = "+MUESTATS: \"scell\",4,460,00,38400,0,231,-1020,-130,-690,5,5\r\n\
++MUESTATS: \"ncell\",4,,,38400,0,336,-1000,-120,-800,-32768,255\r\n\
++MUESTATS: \"ncell\",4,,,3590,0,233,-1040,-130,-820,-32768,255\r\n\
++MUESTATS: \"ncell\",4,,,40936,0,431,-1080,-200,-800,-32768,255\r\n\
++MUESTATS: \"ncell\",4,,,1300,0,170,-1090,-200,-720,-32768,255";
+
+        let mut serving_cell = ServingCell::default();
+        let mut serving = CellInfo {
+            is_serving: true,
+            tech: "lte".to_string(),
+            cell_type: "LTE".to_string(),
+            ..Default::default()
+        };
+        let mut extra = Vec::new();
+        parse_muestats_cell_lines(output, &mut serving_cell, &mut serving, &mut extra);
+
+        assert_eq!(serving.band, "B39");
+        assert_eq!(serving.earfcn, "38400");
+        assert_eq!(serving.pci, "231");
+        assert_eq!(serving.rsrp, "-10200");
+        assert_eq!(serving.rsrq, "-1300");
+        assert_eq!(serving.sinr, "50");
+
+        assert_eq!(extra.len(), 4);
+        assert_eq!(extra[0].band, "B39");
+        assert_eq!(extra[0].earfcn, "38400");
+        assert_eq!(extra[0].pci, "336");
+        assert_eq!(extra[0].rsrp, "-10000");
+        assert_eq!(extra[0].rsrq, "-1200");
+        assert_eq!(extra[0].sinr, "");
+
+        assert_eq!(extra[1].band, "B8");
+        assert_eq!(extra[1].earfcn, "3590");
+        assert_eq!(extra[1].rsrp, "-10400");
+        assert_eq!(extra[1].rsrq, "-1300");
+
+        assert_eq!(extra[2].band, "B41");
+        assert_eq!(extra[2].earfcn, "40936");
+        assert_eq!(extra[2].rsrp, "-10800");
+        assert_eq!(extra[2].rsrq, "-2000");
+
+        assert_eq!(extra[3].band, "B3");
+        assert_eq!(extra[3].earfcn, "1300");
+        assert_eq!(extra[3].rsrp, "-10900");
+        assert_eq!(extra[3].rsrq, "-2000");
+    }
 }
 
 fn parse_mmcli_colon_value(line: &str) -> Option<(String, String)> {
@@ -2915,6 +3092,338 @@ pub async fn stop_cell_monitoring() -> Result<(), String> {
     Ok(())
 }
 
+async fn send_mm_at_command(proxy: &Proxy<'_>, cmd: &str) -> Option<String> {
+    proxy.call("Command", &(cmd, 3u32)).await.ok()
+}
+
+pub fn lte_band_from_earfcn(earfcn: u32) -> Option<&'static str> {
+    match earfcn {
+        0..=599 => Some("B1"),
+        600..=1199 => Some("B2"),
+        1200..=1949 => Some("B3"),
+        1950..=2399 => Some("B4"),
+        2400..=2649 => Some("B5"),
+        2650..=2749 => Some("B6"),
+        2750..=3449 => Some("B7"),
+        3450..=3799 => Some("B8"),
+        3800..=4149 => Some("B9"),
+        4150..=4749 => Some("B10"),
+        4750..=4949 => Some("B11"),
+        5010..=5179 => Some("B12"),
+        5180..=5279 => Some("B13"),
+        5280..=5379 => Some("B14"),
+        5730..=5849 => Some("B17"),
+        5850..=5999 => Some("B18"),
+        6000..=6149 => Some("B19"),
+        6150..=6449 => Some("B20"),
+        6450..=6599 => Some("B21"),
+        6600..=7399 => Some("B22"),
+        7500..=7699 => Some("B23"),
+        7700..=8039 => Some("B24"),
+        8040..=8689 => Some("B25"),
+        8690..=9039 => Some("B26"),
+        9040..=9209 => Some("B27"),
+        9210..=9659 => Some("B28"),
+        9660..=9769 => Some("B29"),
+        9770..=9869 => Some("B30"),
+        9870..=9919 => Some("B31"),
+        9920..=10359 => Some("B32"),
+        36000..=36199 => Some("B33"),
+        36200..=36349 => Some("B34"),
+        36350..=36949 => Some("B35"),
+        36950..=37549 => Some("B36"),
+        37550..=37749 => Some("B37"),
+        37750..=38249 => Some("B38"),
+        38250..=38649 => Some("B39"),
+        38650..=39649 => Some("B40"),
+        39650..=41589 => Some("B41"),
+        41590..=43589 => Some("B42"),
+        43590..=45589 => Some("B43"),
+        45590..=46589 => Some("B44"),
+        46790..=54539 => Some("B46"),
+        54540..=55239 => Some("B47"),
+        55240..=56739 => Some("B48"),
+        65536..=66435 => Some("B65"),
+        66436..=67335 => Some("B66"),
+        67536..=68535 => Some("B70"),
+        68586..=68985 => Some("B71"),
+        _ => None,
+    }
+}
+
+fn parse_cced_line(line: &str, serving_cell: &mut ServingCell, serving: &mut CellInfo) {
+    if let Some(payload) = line.split(':').nth(2).or_else(|| line.split(':').nth(1)) {
+        let parts: Vec<&str> = payload.trim().split(',').map(str::trim).collect();
+        if parts.len() >= 13 {
+            if serving_cell.tech.is_empty() || serving_cell.tech == "gsm" {
+                serving_cell.tech = "lte".to_string();
+            }
+            if serving.tech.is_empty() || serving.tech == "gsm" {
+                serving.tech = "lte".to_string();
+                serving.cell_type = "LTE".to_string();
+            }
+            let band_num = parts[4];
+            if !band_num.is_empty() && serving.band.is_empty() {
+                serving.band = if band_num.to_ascii_uppercase().starts_with('B') {
+                    band_num.to_ascii_uppercase()
+                } else {
+                    format!("B{band_num}")
+                };
+            }
+            let earfcn = parts[6];
+            if !earfcn.is_empty() {
+                if serving.earfcn.is_empty() {
+                    serving.earfcn = earfcn.to_string();
+                }
+                if serving.arfcn.is_empty() {
+                    serving.arfcn = earfcn.to_string();
+                }
+                if serving.band.is_empty() {
+                    if let Ok(earfcn_num) = earfcn.parse::<u32>() {
+                        if let Some(b) = lte_band_from_earfcn(earfcn_num) {
+                            serving.band = b.to_string();
+                        }
+                    }
+                }
+            }
+            if let Ok(cid) = parts[7].parse::<u32>() {
+                if cid != 0 {
+                    serving.cell_id = cid;
+                    serving_cell.cell_id = cid;
+                }
+            }
+            if let Ok(tac) = parts[10].parse::<u32>() {
+                if tac != 0 {
+                    serving_cell.tac = tac;
+                }
+            }
+            let pci = parts[12];
+            if !pci.is_empty() && serving.pci.is_empty() {
+                serving.pci = pci.to_string();
+            }
+        }
+    }
+}
+
+fn parse_muestats_cell_lines(
+    resp: &str,
+    serving_cell: &mut ServingCell,
+    serving: &mut CellInfo,
+    extra_cells: &mut Vec<CellInfo>,
+) {
+    for line in resp.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("+MUESTATS:") {
+            let parts: Vec<&str> = trimmed
+                .strip_prefix("+MUESTATS:")
+                .unwrap_or("")
+                .split(',')
+                .map(|s| s.trim().trim_matches('"'))
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let kind = parts[0];
+            if kind == "scell" && parts.len() >= 11 {
+                if serving_cell.tech.is_empty() || serving_cell.tech == "gsm" {
+                    serving_cell.tech = "lte".to_string();
+                }
+                if serving.tech.is_empty() || serving.tech == "gsm" {
+                    serving.tech = "lte".to_string();
+                    serving.cell_type = "LTE".to_string();
+                }
+                let earfcn = parts[4];
+                let pci = parts[6];
+                if !earfcn.is_empty() {
+                    if serving.earfcn.is_empty() {
+                        serving.earfcn = earfcn.to_string();
+                    }
+                    if serving.arfcn.is_empty() {
+                        serving.arfcn = earfcn.to_string();
+                    }
+                    if serving.band.is_empty() {
+                        if let Ok(earfcn_num) = earfcn.parse::<u32>() {
+                            if let Some(b) = lte_band_from_earfcn(earfcn_num) {
+                                serving.band = b.to_string();
+                            }
+                        }
+                    }
+                }
+                if !pci.is_empty() && serving.pci.is_empty() {
+                    serving.pci = pci.to_string();
+                }
+                if let Ok(raw_rsrp) = parts[7].parse::<i32>() {
+                    if serving.rsrp.is_empty() {
+                        serving.rsrp = (raw_rsrp * 10).to_string();
+                    }
+                }
+                if let Ok(raw_rsrq) = parts[8].parse::<i32>() {
+                    if serving.rsrq.is_empty() {
+                        serving.rsrq = (raw_rsrq * 10).to_string();
+                    }
+                }
+                if let Ok(raw_sinr) = parts[10].parse::<i32>() {
+                    if serving.sinr.is_empty() && raw_sinr != -32768 {
+                        serving.sinr = (raw_sinr * 10).to_string();
+                    }
+                }
+            } else if kind == "ncell" && parts.len() >= 9 {
+                let earfcn = parts[4];
+                let pci = parts[6];
+                if !serving.pci.is_empty()
+                    && !serving.earfcn.is_empty()
+                    && pci == serving.pci
+                    && earfcn == serving.earfcn
+                {
+                    continue;
+                }
+                let band = earfcn
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(lte_band_from_earfcn)
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| {
+                        if !serving.band.is_empty()
+                            && (earfcn.is_empty() || earfcn == serving.earfcn)
+                        {
+                            serving.band.clone()
+                        } else {
+                            String::new()
+                        }
+                    });
+                let rsrp_val = parts[7]
+                    .parse::<i32>()
+                    .ok()
+                    .map(|v| (v * 10).to_string())
+                    .unwrap_or_default();
+                let rsrq_val = parts[8]
+                    .parse::<i32>()
+                    .ok()
+                    .map(|v| (v * 10).to_string())
+                    .unwrap_or_default();
+                let sinr_val = parts
+                    .get(10)
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .filter(|&v| v != -32768)
+                    .map(|v| (v * 10).to_string())
+                    .unwrap_or_default();
+                extra_cells.push(CellInfo {
+                    is_serving: false,
+                    tech: serving.tech.clone(),
+                    cell_id: 0,
+                    band,
+                    arfcn: earfcn.to_string(),
+                    pci: pci.to_string(),
+                    rsrp: rsrp_val,
+                    rsrq: rsrq_val,
+                    sinr: sinr_val,
+                    earfcn: earfcn.to_string(),
+                    nrarfcn: String::new(),
+                    cell_type: serving.cell_type.clone(),
+                    ssb_rsrp: String::new(),
+                    ssb_rsrq: String::new(),
+                    ssb_sinr: String::new(),
+                });
+            }
+        }
+    }
+}
+
+async fn enrich_cells_via_at(
+    conn: &Connection,
+    modem_path: &str,
+    serving_cell: &mut ServingCell,
+    serving: &mut CellInfo,
+    extra_cells: &mut Vec<CellInfo>,
+) {
+    let proxy = match Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // 1. Try AT+CCED=0,1 (supported on ML307X / ASR)
+    // +CCED: LTE current cell:460,00,460000000000001,1,39,5,38400,151211264,37,13,37267,42,231
+    if let Some(resp) = send_mm_at_command(&proxy, "AT+CCED=0,1").await {
+        if let Some(line) = resp.lines().find(|l| l.contains("+CCED:")) {
+            parse_cced_line(line, serving_cell, serving);
+        }
+    }
+
+    // 2. Try AT+MUESTATS=cell (serving cell + neighbor cells)
+    // +MUESTATS: "scell",4,460,00,38400,0,231,-1060,-150,-700,-25,5
+    // +MUESTATS: "ncell",4,,,38400,0,313,-1030,-150,-810,-32768,255
+    if let Some(resp) = send_mm_at_command(&proxy, "AT+MUESTATS=cell").await {
+        parse_muestats_cell_lines(&resp, serving_cell, serving, extra_cells);
+    }
+
+    // 3. Try AT+MUESTATS=sband if band is still empty
+    // +MUESTATS: "sband",39
+    if serving.band.is_empty() {
+        if let Some(resp) = send_mm_at_command(&proxy, "AT+MUESTATS=sband").await {
+            for line in resp.lines() {
+                if let Some(pos) = line.find("+MUESTATS:") {
+                    let text = &line[pos + 10..];
+                    let parts: Vec<&str> = text.split(',').map(|s| s.trim().trim_matches('"')).collect();
+                    if parts.len() >= 2 && parts[0] == "sband" {
+                        let b = parts[1];
+                        if !b.is_empty() {
+                            serving.band = if b.to_ascii_uppercase().starts_with('B') {
+                                b.to_ascii_uppercase()
+                            } else {
+                                format!("B{b}")
+                            };
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Try AT+QNWINFO if band or arfcn is still empty
+    // +QNWINFO: "TDD LTE",46000,"LTE BAND 39",38400
+    if serving.band.is_empty() || serving.arfcn.is_empty() {
+        if let Some(resp) = send_mm_at_command(&proxy, "AT+QNWINFO").await {
+            if let Some(line) = resp.lines().find(|l| l.contains("+QNWINFO:")) {
+                let text = line.split(':').nth(1).unwrap_or("");
+                let parts: Vec<&str> = text.split(',').map(|s| s.trim().trim_matches('"')).collect();
+                if parts.len() >= 4 {
+                    let band_str = parts[2];
+                    if serving.band.is_empty() {
+                        if let Some(pos) = band_str.find("BAND") {
+                            let b_digits: String = band_str[pos + 4..].chars().filter(char::is_ascii_digit).collect();
+                            if !b_digits.is_empty() {
+                                serving.band = format!("B{b_digits}");
+                            }
+                        }
+                    }
+                    let earfcn = parts[3];
+                    if !earfcn.is_empty() {
+                        if serving.earfcn.is_empty() { serving.earfcn = earfcn.to_string(); }
+                        if serving.arfcn.is_empty() { serving.arfcn = earfcn.to_string(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. If serving band still empty, derive from earfcn
+    if serving.band.is_empty() && !serving.earfcn.is_empty() {
+        if let Ok(earfcn_num) = serving.earfcn.parse::<u32>() {
+            if let Some(b) = lte_band_from_earfcn(earfcn_num) {
+                serving.band = b.to_string();
+            }
+        }
+    }
+
+    // 6. Ensure neighbor cells have band populated if matching serving cell
+    for cell in extra_cells.iter_mut() {
+        if cell.band.is_empty() && !serving.band.is_empty() && (cell.earfcn.is_empty() || cell.earfcn == serving.earfcn) {
+            cell.band = serving.band.clone();
+        }
+    }
+}
+
 async fn get_cells_data_mmcli_fallback(
     conn: &Connection,
     modem_path: &str,
@@ -2941,11 +3450,7 @@ async fn get_cells_data_mmcli_fallback(
     let tac = parse_hex_u32(&tac_text);
     let cell_id = parse_hex_u32(&cid_text);
 
-    if tac == 0 && cell_id == 0 {
-        return Ok(CellsResponse::default());
-    }
-
-    let serving = CellInfo {
+    let mut serving = CellInfo {
         is_serving: true,
         tech: tech.clone(),
         cell_id,
@@ -2973,9 +3478,27 @@ async fn get_cells_data_mmcli_fallback(
         ssb_sinr: String::new(),
     };
 
+    let mut serving_cell = ServingCell { tech, cell_id, tac };
+    let mut extra_cells = Vec::new();
+
+    if serving.band.is_empty() || serving.pci.is_empty() || serving.arfcn.is_empty() {
+        enrich_cells_via_at(conn, modem_path, &mut serving_cell, &mut serving, &mut extra_cells).await;
+    }
+
+    if serving.cell_id == 0 && serving_cell.cell_id != 0 {
+        serving.cell_id = serving_cell.cell_id;
+    }
+
+    if serving_cell.tac == 0 && serving_cell.cell_id == 0 && serving.arfcn.is_empty() && extra_cells.is_empty() {
+        return Ok(CellsResponse::default());
+    }
+
+    let mut all_cells = vec![serving];
+    all_cells.extend(extra_cells);
+
     Ok(CellsResponse {
-        serving_cell: ServingCell { tech, cell_id, tac },
-        cells: vec![serving],
+        serving_cell,
+        cells: all_cells,
     })
 }
 
@@ -2988,7 +3511,11 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
     }
 
     let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM).await?;
-    let cells: Vec<HashMap<String, OwnedValue>> = match proxy.call("GetCellInfo", &()).await {
+    let res: zbus::Result<Vec<HashMap<String, OwnedValue>>> = proxy.call("GetCellInfo", &()).await;
+    let cells = match res {
+        Ok(v) if v.is_empty() => {
+            return get_cells_data_mmcli_fallback(conn, &modem_path).await;
+        }
         Ok(v) => v,
         Err(e) if is_get_cellinfo_unsupported(&e) => {
             return get_cells_data_mmcli_fallback(conn, &modem_path).await;
@@ -3085,6 +3612,21 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
             ),
             ssb_sinr: parse_cell_metric(cell.get("ssb-sinr").or_else(|| cell.get("ss-sinr"))),
         });
+    }
+
+    if let Some(serving_pos) = parsed_cells.iter().position(|c| c.is_serving) {
+        if parsed_cells[serving_pos].band.is_empty() {
+            let mut extra_cells = Vec::new();
+            enrich_cells_via_at(
+                conn,
+                &modem_path,
+                &mut serving_cell,
+                &mut parsed_cells[serving_pos],
+                &mut extra_cells,
+            )
+            .await;
+            parsed_cells.extend(extra_cells);
+        }
     }
 
     Ok(CellsResponse {
@@ -3501,6 +4043,159 @@ pub async fn set_data_connection_with_apn(
     set_data_connection_inner(conn, active, allow_roaming, configured_apn).await
 }
 
+fn has_usable_data_address(interface: &NetworkInterfaceInfo) -> bool {
+    interface.ip_addresses.iter().any(|address| {
+        !address.address.trim().is_empty()
+            && !matches!(address.scope.as_str(), "link-local" | "loopback")
+    })
+}
+
+fn data_path_health_from_interfaces(
+    control_plane_connected: bool,
+    profile_active: bool,
+    profile_interfaces: &[String],
+    interfaces: &[NetworkInterfaceInfo],
+) -> DataPathHealth {
+    let mut health = DataPathHealth {
+        control_plane_connected,
+        profile_active,
+        ..DataPathHealth::default()
+    };
+
+    if !control_plane_connected {
+        health.reason = Some("ModemManager control plane is not connected".to_string());
+        return health;
+    }
+    if !profile_active {
+        health.reason = Some("NetworkManager cellular data profile is not active".to_string());
+        return health;
+    }
+    if profile_interfaces.is_empty() {
+        health.reason = Some("NetworkManager cellular data profile has no device".to_string());
+        return health;
+    }
+
+    let matched_interfaces = interfaces
+        .iter()
+        .filter(|interface| profile_interfaces.iter().any(|name| name == &interface.name))
+        .collect::<Vec<_>>();
+    let selected = matched_interfaces
+        .iter()
+        .copied()
+        .find(|interface| {
+            interface.status.eq_ignore_ascii_case("up") && has_usable_data_address(interface)
+        })
+        .or_else(|| matched_interfaces.first().copied());
+
+    let Some(interface) = selected else {
+        health.reason = Some(format!(
+            "NetworkManager data device is not present: {}",
+            profile_interfaces.join(", ")
+        ));
+        return health;
+    };
+
+    health.interface = Some(interface.name.clone());
+    health.has_address = has_usable_data_address(interface);
+    health.has_default_route = interface.is_default_ipv4 || interface.is_default_ipv6;
+    if !interface.status.eq_ignore_ascii_case("up") {
+        health.reason = Some(format!(
+            "Cellular data interface {} is {}",
+            interface.name, interface.status
+        ));
+        return health;
+    }
+    if !health.has_address {
+        health.reason = Some(format!(
+            "Cellular data interface {} has no usable address",
+            interface.name
+        ));
+        return health;
+    }
+
+    health.data_plane_ready = true;
+    health
+}
+
+fn data_path_health_with_reason(
+    control_plane_connected: bool,
+    reason: impl Into<String>,
+) -> DataPathHealth {
+    DataPathHealth {
+        control_plane_connected,
+        reason: Some(reason.into()),
+        ..DataPathHealth::default()
+    }
+}
+
+/// Returns the health of the normal cellular-data connection owned by
+/// NetworkManager. `active` and this health are deliberately distinct: the
+/// former reports ModemManager's control plane while this validates that the
+/// profile has an up interface and an assigned address in Linux.
+pub async fn get_cellular_data_path_health(conn: &Connection) -> zbus::Result<DataPathHealth> {
+    let modem_path = find_modem_path(conn).await?;
+    let state = modem_state(conn, &modem_path).await.unwrap_or(0);
+    let control_plane_connected = state >= MM_MODEM_STATE_CONNECTED;
+
+    let profile = match find_nm_modem_connection().await {
+        Ok(profile) => profile,
+        Err(err) => {
+            return Ok(data_path_health_with_reason(
+                control_plane_connected,
+                format!("NetworkManager cellular data profile is unavailable: {err}"),
+            ));
+        }
+    };
+    let (profile_active, profile_interfaces) = match nm_connection_runtime_state(&profile).await {
+        Ok(state) => state,
+        Err(err) => {
+            return Ok(data_path_health_with_reason(
+                control_plane_connected,
+                format!("Failed to inspect NetworkManager cellular data profile: {err}"),
+            ));
+        }
+    };
+    let interfaces = match crate::utils::read_network_interfaces(None).await {
+        Ok(interfaces) => interfaces,
+        Err(err) => {
+            return Ok(data_path_health_with_reason(
+                control_plane_connected,
+                format!("Failed to inspect network interfaces: {err}"),
+            ));
+        }
+    };
+
+    Ok(data_path_health_from_interfaces(
+        control_plane_connected,
+        profile_active,
+        &profile_interfaces,
+        &interfaces,
+    ))
+}
+
+async fn wait_for_cellular_data_path_health(conn: &Connection) -> zbus::Result<DataPathHealth> {
+    let mut last_health = DataPathHealth::default();
+    for attempt in 0..DATA_PATH_HEALTH_RETRY_COUNT {
+        let health = get_cellular_data_path_health(conn).await?;
+        if health.data_plane_ready {
+            return Ok(health);
+        }
+        last_health = health;
+        if attempt + 1 < DATA_PATH_HEALTH_RETRY_COUNT {
+            tokio::time::sleep(DATA_PATH_HEALTH_RETRY_INTERVAL).await;
+        }
+    }
+
+    Err(zbus::fdo::Error::Failed(format!(
+        "NetworkManager reported the cellular data profile active, but its data path is unhealthy: {}",
+        last_health
+            .reason
+            .as_deref()
+            .unwrap_or("no usable interface or address")
+    ))
+    .into())
+}
+
 async fn set_data_connection_inner(
     conn: &Connection,
     active: bool,
@@ -3515,15 +4210,46 @@ async fn set_data_connection_inner(
             )))?;
 
         if active {
-            // 检查 modem 状态，避免重复连接
+            // Do not equate ModemManager's Connected state with a working
+            // Linux data path. A stale bearer can leave the modem connected
+            // while the profile device is down, which requires a controlled
+            // NetworkManager reactivation rather than a duplicate no-op.
             if let Ok(modem_path) = find_modem_path(conn).await {
                 let state = modem_state(conn, &modem_path).await.unwrap_or(0);
                 if state >= MM_MODEM_STATE_CONNECTED {
-                    info!(
-                        state = mm_state_to_string(state),
-                        "Data connection already active, skipping duplicate connect"
-                    );
-                    return Ok(());
+                    match get_cellular_data_path_health(conn).await {
+                        Ok(health) if health.data_plane_ready => {
+                            info!(
+                                state = mm_state_to_string(state),
+                                interface = health.interface.as_deref().unwrap_or("unknown"),
+                                "Cellular data connection and data path are already healthy"
+                            );
+                            return Ok(());
+                        }
+                        Ok(health) => {
+                            warn!(
+                                state = mm_state_to_string(state),
+                                profile_active = health.profile_active,
+                                interface = health.interface.as_deref().unwrap_or("unknown"),
+                                reason = health.reason.as_deref().unwrap_or("unknown"),
+                                "Cellular data control plane is connected but the data path is unhealthy; recovering through NetworkManager"
+                            );
+                            if health.profile_active {
+                                nm_deactivate_connection(&profile).await.map_err(|err| {
+                                    zbus::fdo::Error::Failed(format!(
+                                        "NM cellular data path recovery could not deactivate the stale profile: {err}"
+                                    ))
+                                })?;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                state = mm_state_to_string(state),
+                                error = %err,
+                                "Could not verify the existing cellular data path; requesting NetworkManager activation"
+                            );
+                        }
+                    }
                 }
                 if data_connection_transition_in_progress(state) {
                     info!(
@@ -3560,18 +4286,30 @@ async fn set_data_connection_inner(
                 apn_source = connect_settings.source.unwrap_or("none"),
                 "Data connection activated via NetworkManager"
             );
+            let health = wait_for_cellular_data_path_health(conn).await?;
+            info!(
+                interface = health.interface.as_deref().unwrap_or("unknown"),
+                has_default_route = health.has_default_route,
+                "Cellular data path verified after NetworkManager activation"
+            );
         } else {
             // 通过 NM 停用连接
             if let Err(err) = nm_deactivate_connection(&profile).await {
-                // 如果已经断开，忽略错误
-                if !get_data_connection_status(conn).await.unwrap_or(false) {
-                    warn!(error = %err, "NM deactivation returned error but data is already disconnected");
-                } else {
+                // Only the NetworkManager profile belongs to normal cellular
+                // data. Its state, not the modem-wide state, decides whether
+                // a failed deactivation was merely an already-disconnected
+                // profile.
+                let profile_active = nm_connection_runtime_state(&profile)
+                    .await
+                    .map(|(active, _)| active)
+                    .unwrap_or(true);
+                if profile_active {
                     return Err(zbus::fdo::Error::Failed(format!(
                         "NM 连接停用失败: {err}"
                     ))
                     .into());
                 }
+                warn!(error = %err, "NM deactivation returned error but the cellular data profile is already inactive");
             }
             info!("Data connection disconnected via NetworkManager");
         }
@@ -5361,7 +6099,27 @@ pub async fn init_data_connection(
         return format!("Modem not registered (state: {state_text}), skipping auto-connect");
     }
     if state >= MM_MODEM_STATE_CONNECTED {
-        return format!("Data connection already active (state: {state_text})");
+        match get_cellular_data_path_health(conn).await {
+            Ok(health) if health.data_plane_ready => {
+                return format!("Cellular data path already healthy (state: {state_text})");
+            }
+            Ok(health) => {
+                warn!(
+                    state = %state_text,
+                    profile_active = health.profile_active,
+                    interface = health.interface.as_deref().unwrap_or("unknown"),
+                    reason = health.reason.as_deref().unwrap_or("unknown"),
+                    "Startup found a connected modem with an unhealthy cellular data path; requesting NetworkManager recovery"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    state = %state_text,
+                    error = %err,
+                    "Startup could not verify the existing cellular data path; requesting NetworkManager activation"
+                );
+            }
+        }
     }
     if data_connection_transition_in_progress(state) {
         return format!("Data connection transition in progress (state: {state_text}), waiting");
@@ -5466,6 +6224,49 @@ async fn find_nm_modem_connection() -> Result<String, String> {
     }
 
     Err("no gsm connection profile found in NetworkManager".to_string())
+}
+
+fn nm_connection_state_is_activated(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value == "activated"
+        || value.starts_with("100 ")
+        || value.starts_with("100(")
+        || value.starts_with("100 (")
+        || value.ends_with("(activated)")
+}
+
+fn parse_nm_connection_runtime_state(output: &str) -> (bool, Vec<String>) {
+    let mut values = output
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let profile_active = values
+        .next()
+        .is_some_and(nm_connection_state_is_activated);
+    let devices = values
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "--")
+        .map(str::to_string)
+        .collect();
+    (profile_active, devices)
+}
+
+async fn nm_connection_runtime_state(profile: &str) -> Result<(bool, Vec<String>), String> {
+    let output = run_recovery_command_owned(
+        "nmcli",
+        &[
+            "--terse".into(),
+            "--get-values".into(),
+            "GENERAL.STATE,GENERAL.DEVICES".into(),
+            "connection".into(),
+            "show".into(),
+            profile.into(),
+        ],
+        Duration::from_secs(10),
+    )
+    .await?;
+    Ok(parse_nm_connection_runtime_state(&output))
 }
 
 async fn create_nm_modem_connection() -> Result<String, String> {
@@ -5729,119 +6530,144 @@ async fn power_cycle_sim_for_profile_switch_inner(
         None,
     );
 
-    let initial_qmi_device = match find_modem_path(conn).await {
-        Ok(modem_path) => {
+    let initial_modem_path = find_modem_path(conn).await.ok();
+    let initial_qmi_device = match &initial_modem_path {
+        Some(modem_path) => {
             record_baseband_step(&mut steps, "定位当前基带", "ok", Some(modem_path.clone()));
-            qmi_control_device(conn, &modem_path)
+            qmi_control_device(conn, modem_path)
                 .await
                 .or_else(find_qmi_device_path)
         }
-        Err(err) => {
+        None => {
             record_baseband_step(
                 &mut steps,
                 "定位当前基带",
                 "warning",
-                Some(format!("D-Bus 暂不可用，改用设备节点兜底：{err}")),
+                Some("D-Bus 暂不可用，改用设备节点兜底".to_string()),
             );
             find_qmi_device_path()
         }
     };
 
-    record_baseband_step(&mut steps, "停止 ModemManager", "running", None);
-    match run_recovery_command("systemctl", &["stop", "ModemManager"]).await {
-        Ok(output) => record_baseband_step(&mut steps, "停止 ModemManager", "ok", Some(output)),
-        Err(err) => record_baseband_step(
+    let modem_path = if initial_qmi_device.is_none() {
+        // 非 QMI 设备（如 ML307X 等 Cat.1 串口模组）：
+        // 无需停止 ModemManager 或调用 qmicli，直接通过 D-Bus 下发 AT+CFUN=0/1 实现平滑 SIM 重读与蜂窝重附着
+        record_baseband_step(
             &mut steps,
-            "停止 ModemManager",
-            "warning",
-            Some(format!("停止失败，继续尝试 SIM 断电：{err}")),
-        ),
-    }
-    // Poll for MM to become inactive instead of a fixed 3s sleep
-    for _ in 0..6 {
-        match Command::new("systemctl")
-            .args(["is-active", "--quiet", "ModemManager.service"])
-            .status()
-            .await
-        {
-            Ok(status) if !status.success() => break,
-            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            "非 QMI 设备：通过 AT+CFUN 刷新 SIM 协议栈",
+            "running",
+            None,
+        );
+        let path = initial_modem_path.unwrap_or_else(|| "/org/freedesktop/ModemManager1/Modem/0".to_string());
+        if let Ok(proxy) = Proxy::new(conn, MM_SERVICE, path.as_str(), MM_MODEM).await {
+            let _ = send_mm_at_command(&proxy, "AT+CFUN=0").await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = send_mm_at_command(&proxy, "AT+CFUN=1").await;
+            tokio::time::sleep(Duration::from_millis(2000)).await;
         }
-    }
-
-    let power_result: Result<(), String> = async {
-        let qmi_device =
-            wait_for_qmi_device_path(initial_qmi_device.as_deref(), Duration::from_secs(12))
+        record_baseband_step(
+            &mut steps,
+            "非 QMI 设备：通过 AT+CFUN 刷新 SIM 协议栈",
+            "ok",
+            Some(format!("基带路径保持不变：{path}")),
+        );
+        path
+    } else {
+        // 标准 QMI 设备流程：断电重启 ModemManager 与 SIM
+        record_baseband_step(&mut steps, "停止 ModemManager", "running", None);
+        match run_recovery_command("systemctl", &["stop", "ModemManager"]).await {
+            Ok(output) => record_baseband_step(&mut steps, "停止 ModemManager", "ok", Some(output)),
+            Err(err) => record_baseband_step(
+                &mut steps,
+                "停止 ModemManager",
+                "warning",
+                Some(format!("停止失败，继续尝试 SIM 断电：{err}")),
+            ),
+        }
+        // Poll for MM to become inactive instead of a fixed 3s sleep
+        for _ in 0..6 {
+            match Command::new("systemctl")
+                .args(["is-active", "--quiet", "ModemManager.service"])
+                .status()
                 .await
-                .ok_or_else(|| "未找到 QMI 设备节点，无法执行 SIM 断电上电".to_string())?;
-        record_baseband_step(&mut steps, "定位 QMI 设备", "ok", Some(qmi_device.clone()));
-
-        record_baseband_step(&mut steps, "SIM 断电", "running", None);
-        match qmicli_sim_power(&qmi_device, false).await {
-            Ok(output) => record_baseband_step(&mut steps, "SIM 断电", "ok", Some(output)),
-            Err(err) => {
-                record_baseband_step(&mut steps, "SIM 断电", "error", Some(err.clone()));
-                return Err(err);
+            {
+                Ok(status) if !status.success() => break,
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
             }
+        }
+
+        let power_result: Result<(), String> = async {
+            let qmi_device =
+                wait_for_qmi_device_path(initial_qmi_device.as_deref(), Duration::from_secs(12))
+                    .await
+                    .ok_or_else(|| "未找到 QMI 设备节点，无法执行 SIM 断电上电".to_string())?;
+            record_baseband_step(&mut steps, "定位 QMI 设备", "ok", Some(qmi_device.clone()));
+
+            record_baseband_step(&mut steps, "SIM 断电", "running", None);
+            match qmicli_sim_power(&qmi_device, false).await {
+                Ok(output) => record_baseband_step(&mut steps, "SIM 断电", "ok", Some(output)),
+                Err(err) => {
+                    record_baseband_step(&mut steps, "SIM 断电", "error", Some(err.clone()));
+                    return Err(err);
+                }
+            }
+
+            record_baseband_step(
+                &mut steps,
+                "等待 SIM 断电完成",
+                "running",
+                Some("等待 1 秒".to_string()),
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            record_baseband_step(&mut steps, "等待 SIM 断电完成", "ok", None);
+
+            let qmi_device = wait_for_qmi_device_path(Some(&qmi_device), Duration::from_secs(12))
+                .await
+                .ok_or_else(|| "SIM 断电后未重新找到 QMI 设备节点".to_string())?;
+            record_baseband_step(&mut steps, "SIM 上电", "running", None);
+            match qmicli_sim_power(&qmi_device, true).await {
+                Ok(output) => record_baseband_step(&mut steps, "SIM 上电", "ok", Some(output)),
+                Err(err) => {
+                    record_baseband_step(&mut steps, "SIM 上电", "error", Some(err.clone()));
+                    return Err(err);
+                }
+            }
+
+            record_baseband_step(
+                &mut steps,
+                "等待 SIM 重新上电",
+                "running",
+                Some("等待 1 秒".to_string()),
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            record_baseband_step(&mut steps, "等待 SIM 重新上电", "ok", None);
+            Ok(())
+        }
+        .await;
+
+        record_baseband_step(&mut steps, "启动 ModemManager", "running", None);
+        let start_result = run_recovery_command("systemctl", &["start", "ModemManager"]).await;
+        match &start_result {
+            Ok(output) => {
+                record_baseband_step(&mut steps, "启动 ModemManager", "ok", Some(output.clone()))
+            }
+            Err(err) => {
+                record_baseband_step(&mut steps, "启动 ModemManager", "error", Some(err.clone()))
+            }
+        }
+
+        power_result?;
+        if let Err(err) = start_result {
+            return Err(format!("SIM 已重新上电，但 ModemManager 启动失败：{err}"));
         }
 
         record_baseband_step(
             &mut steps,
-            "等待 SIM 断电完成",
+            "等待基带重新枚举",
             "running",
-            Some("等待 1 秒".to_string()),
+            Some("轮询等待 Modem 出现（最长 15 秒）".to_string()),
         );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        record_baseband_step(&mut steps, "等待 SIM 断电完成", "ok", None);
-
-        let qmi_device = wait_for_qmi_device_path(Some(&qmi_device), Duration::from_secs(12))
-            .await
-            .ok_or_else(|| "SIM 断电后未重新找到 QMI 设备节点".to_string())?;
-        record_baseband_step(&mut steps, "SIM 上电", "running", None);
-        match qmicli_sim_power(&qmi_device, true).await {
-            Ok(output) => record_baseband_step(&mut steps, "SIM 上电", "ok", Some(output)),
-            Err(err) => {
-                record_baseband_step(&mut steps, "SIM 上电", "error", Some(err.clone()));
-                return Err(err);
-            }
-        }
-
-        record_baseband_step(
-            &mut steps,
-            "等待 SIM 重新上电",
-            "running",
-            Some("等待 1 秒".to_string()),
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        record_baseband_step(&mut steps, "等待 SIM 重新上电", "ok", None);
-        Ok(())
-    }
-    .await;
-
-    record_baseband_step(&mut steps, "启动 ModemManager", "running", None);
-    let start_result = run_recovery_command("systemctl", &["start", "ModemManager"]).await;
-    match &start_result {
-        Ok(output) => {
-            record_baseband_step(&mut steps, "启动 ModemManager", "ok", Some(output.clone()))
-        }
-        Err(err) => {
-            record_baseband_step(&mut steps, "启动 ModemManager", "error", Some(err.clone()))
-        }
-    }
-
-    power_result?;
-    if let Err(err) = start_result {
-        return Err(format!("SIM 已重新上电，但 ModemManager 启动失败：{err}"));
-    }
-
-    record_baseband_step(
-        &mut steps,
-        "等待基带重新枚举",
-        "running",
-        Some("轮询等待 Modem 出现（最长 15 秒）".to_string()),
-    );
-    // Poll for modem to reappear instead of a fixed 10s sleep
-    let modem_path = {
+        // Poll for modem to reappear instead of a fixed 10s sleep
         let enum_deadline = Instant::now() + Duration::from_secs(15);
         let mut found_path = None;
         loop {
@@ -6275,21 +7101,85 @@ pub async fn data_connection_watchdog(
                             mm_state_to_string(state)
                         )
                     } else if state >= MM_MODEM_STATE_CONNECTED {
-                        last_data_activation_attempt_at = None;
-                        data_activation_failure_active = false;
-                        if cellular_problem_active {
-                            system_events
-                                .emit_code(
-                                    system_event_codes::CELLULAR_CONNECTION_RECOVERED,
-                                    system_event_severity::INFO,
-                                    system_event_status::RECOVERED,
-                                    modem_path.to_string(),
-                                    "蜂窝数据连接已恢复",
+                        match get_cellular_data_path_health(&conn).await {
+                            Ok(health) if health.data_plane_ready => {
+                                last_data_activation_attempt_at = None;
+                                data_activation_failure_active = false;
+                                if cellular_problem_active {
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::CELLULAR_CONNECTION_RECOVERED,
+                                            system_event_severity::INFO,
+                                            system_event_status::RECOVERED,
+                                            modem_path.to_string(),
+                                            "蜂窝数据连接已恢复",
+                                        )
+                                        .await;
+                                    cellular_problem_active = false;
+                                }
+                                format!(
+                                    "Connected (data path: {})",
+                                    health.interface.as_deref().unwrap_or("ready")
                                 )
-                                .await;
-                            cellular_problem_active = false;
+                            }
+                            Ok(health) => {
+                                let cooldown_active = last_data_activation_attempt_at
+                                    .map(|at| {
+                                        at.elapsed()
+                                            < Duration::from_secs(DATA_CONNECT_RETRY_COOLDOWN_SECS)
+                                    })
+                                    .unwrap_or(false);
+                                let reason = health
+                                    .reason
+                                    .as_deref()
+                                    .unwrap_or("no usable interface or address");
+                                if cooldown_active {
+                                    format!(
+                                        "Connected control plane but unhealthy data path ({reason}); recovery cooldown active"
+                                    )
+                                } else {
+                                    last_data_activation_attempt_at = Some(Instant::now());
+                                    cellular_problem_active = true;
+                                    warn!(
+                                        interface = health.interface.as_deref().unwrap_or("unknown"),
+                                        profile_active = health.profile_active,
+                                        reason,
+                                        "Watchdog detected a connected modem with an unhealthy cellular data path; requesting NetworkManager recovery"
+                                    );
+                                    let allow_roaming = config.get_roaming_allowed();
+                                    let apn_config = config.get_apn_config();
+                                    match set_data_connection_with_apn(
+                                        &conn,
+                                        true,
+                                        allow_roaming,
+                                        Some(&apn_config),
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => "Recovered cellular data path through NetworkManager".to_string(),
+                                        Err(err) => {
+                                            if !data_activation_failure_active {
+                                                system_events
+                                                    .emit_code(
+                                                        system_event_codes::CELLULAR_ACTIVATION_FAILED,
+                                                        system_event_severity::WARNING,
+                                                        system_event_status::FAILED,
+                                                        modem_path.to_string(),
+                                                        format!("蜂窝数据通路恢复失败: {err}"),
+                                                    )
+                                                    .await;
+                                                data_activation_failure_active = true;
+                                            }
+                                            format!("Cellular data path recovery failed: {err}")
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(error = %err, "Watchdog could not inspect the cellular data path");
+                                format!("Connected but data path health check failed: {err}")
+                            }
                         }
-                        "Connected".to_string()
                     } else if data_connection_transition_in_progress(state) {
                         transition_stuck_count += 1;
                         if transition_stuck_count >= TRANSITION_STUCK_THRESHOLD {
