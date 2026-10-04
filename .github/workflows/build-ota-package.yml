@@ -159,7 +159,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          ./scripts/pack-ota.sh --target="$TARGET"
+          ./scripts/build/pack-ota.sh --target="$TARGET" --standard
           case "$TARGET" in
             aarch64-unknown-linux-musl)
               ARCH_SUFFIX="aarch64"
